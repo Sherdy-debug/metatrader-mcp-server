@@ -29,12 +29,16 @@ blocked instead of assuming that there is none.
 
 Concurrency: the checks, the request and the reservation of an opening order
 run under one lock per :class:`RiskGuard` (one per connection). An order that
-was sent keeps a reservation of one slot and its volume until the terminal
-lists it or ``RESERVATION_TTL_SECONDS`` pass; a rejected order reserves
-nothing; an order with an unknown outcome stays reserved for the full TTL. The
-protection covers threads sharing a connection in one process. It does not
-coordinate other processes, other connections, manual trading or other robots
-using the same account.
+was sent is reserved until the terminal lists it or ``RESERVATION_TTL_SECONDS``
+pass, in two parts reconciled independently: the executed volume (released as
+positions with the order ticket appear) and the volume still working as an
+order (released when the order is listed with its current volume). A partial
+fill with RETURN filling keeps its remainder reserved; with IOC or FOK the
+remainder is cancelled by the server and is not reserved. A rejected order
+reserves nothing; an order with an unknown outcome stays reserved for the full
+TTL. The protection covers threads sharing a connection in one process. It does
+not coordinate other processes, other connections, manual trading or other
+robots using the same account.
 """
 
 import logging
@@ -50,6 +54,9 @@ logger = logging.getLogger(__name__)
 
 ACCOUNT_TRADE_MODE_DEMO = 0
 RESERVATION_TTL_SECONDS = 60.0
+ORDER_FILLING_FOK = 0
+ORDER_FILLING_IOC = 1
+_EPS = 1e-9
 DEAL_TYPE_BUY = 0
 DEAL_TYPE_SELL = 1
 
@@ -112,9 +119,36 @@ class RiskConfig:
 
 @dataclass
 class _Reservation:
+    """
+    Exposure sent to the terminal but possibly not listed yet.
+
+    ``executed`` is the filled volume, expected as positions whose ticket or
+    identifier is the order ticket. ``working`` is the volume still active as
+    an order with that ticket (pending orders, RETURN remainders, accepted but
+    unfilled market orders).
+    """
     ticket: Optional[int]
-    volume: float
+    executed: float
+    working: float
     created: float
+
+    def unlisted(self, positions, orders) -> Tuple[float, float]:
+        """Return the (executed, working) volume that the listings do not show yet."""
+        if self.ticket is None:
+            return self.executed, self.working
+        in_positions = sum(
+            float(p.volume) for p in positions
+            if self.ticket in (getattr(p, "ticket", None), getattr(p, "identifier", None))
+        )
+        order_listed = any(getattr(o, "ticket", None) == self.ticket for o in orders)
+        executed = max(0.0, self.executed - in_positions)
+        if order_listed:
+            # The listing already counts the order with its current volume.
+            working = 0.0
+        else:
+            # Volume filled beyond the executed part (the remainder filling later) leaves the working part.
+            working = max(0.0, self.executed + self.working - in_positions) - executed
+        return executed, working
 
 
 def _read(mt5, function: str, **kwargs) -> Tuple[Optional[tuple], Optional[str]]:
@@ -200,19 +234,20 @@ class RiskGuard:
             orders, error = _read(mt5, "orders_get")
             if error:
                 return f"Cannot verify exposure limits, new orders are blocked: {error}"
-            reserved = self._active_reservations(positions, orders)
-            open_count = len(positions) + len(orders) + len(reserved)
+            reserved = self._unlisted_reservations(positions, orders)
+            reserved_slots = sum((executed > _EPS) + (working > _EPS) for executed, working in reserved)
+            open_count = len(positions) + len(orders) + reserved_slots
             if cfg.max_open_positions is not None and open_count + 1 > cfg.max_open_positions:
                 return (
                     f"Opening this order would exceed the limit of {cfg.max_open_positions} "
                     f"open positions and pending orders ({len(positions)} positions, {len(orders)} orders, "
-                    f"{len(reserved)} recently sent)"
+                    f"{reserved_slots} recently sent and not listed yet)"
                 )
             if cfg.max_total_volume is not None:
                 current = (
                     sum(float(p.volume) for p in positions)
                     + sum(float(o.volume_current) for o in orders)
-                    + sum(r.volume for r in reserved)
+                    + sum(executed + working for executed, working in reserved)
                 )
                 if current + volume > cfg.max_total_volume + 1e-9:
                     return (
@@ -339,10 +374,14 @@ class RiskGuard:
         """
         Apply the reservation policy to the outcome of an opening order.
 
-        - done / placed / partial: remember the request and reserve the executed
-          (or placed) volume until the terminal lists the order or position.
-        - no_response: remember the request and reserve the requested volume for
-          the full TTL, because the order may have been executed.
+        - done: the requested volume is reserved as executed.
+        - partial: the filled volume is reserved as executed. The remainder is
+          reserved as working unless the request used IOC or FOK filling, whose
+          remainder the server cancels; with RETURN or an unknown policy it stays.
+        - placed: the requested volume is reserved as working (pending orders,
+          market orders accepted but not filled yet).
+        - no_response: the requested volume is reserved for the full TTL and the
+          request is remembered, because it may have been executed.
         - rejected or anything else: nothing is reserved.
         """
         status = response.get("status")
@@ -351,27 +390,49 @@ class RiskGuard:
         if duplicate_key is not None:
             self.record(duplicate_key)
         result = response.get("data")
+        request = response.get("request") or {}
         ticket = getattr(result, "order", None) or None
-        if status == "partial":
-            volume = float(getattr(result, "volume", 0) or 0) or volume
-        with self._lock:
-            self._reservations.append(_Reservation(ticket=ticket, volume=float(volume), created=time.monotonic()))
+        volume = float(volume)
 
-    def _active_reservations(self, positions, orders) -> List[_Reservation]:
-        """Drop reservations that expired or that the terminal already lists, return the others."""
-        listed = set()
-        for item in positions:
-            listed.add(getattr(item, "ticket", None))
-            listed.add(getattr(item, "identifier", None))
-        for item in orders:
-            listed.add(getattr(item, "ticket", None))
-        now = time.monotonic()
+        if status == "done":
+            executed, working = volume, 0.0
+        elif status == "partial":
+            executed = min(float(getattr(result, "volume", 0) or 0), volume)
+            remainder = volume - executed
+            cancelled = request.get("type_filling") in (ORDER_FILLING_IOC, ORDER_FILLING_FOK)
+            working = 0.0 if cancelled else remainder
+        elif status == "placed":
+            executed, working = 0.0, volume
+        else:  # no_response: no ticket, kept for the full TTL
+            executed, working = volume, 0.0
+
         with self._lock:
-            self._reservations = [
-                r for r in self._reservations
-                if now - r.created < RESERVATION_TTL_SECONDS and (r.ticket is None or r.ticket not in listed)
-            ]
-            return list(self._reservations)
+            self._reservations.append(
+                _Reservation(ticket=ticket, executed=executed, working=working, created=time.monotonic())
+            )
+
+    def _unlisted_reservations(self, positions, orders) -> List[Tuple[float, float]]:
+        """
+        Reconcile reservations with the listings.
+
+        Returns the (executed, working) volume of each reservation that the
+        listings do not show yet, and drops reservations that expired or are
+        fully listed.
+        """
+        now = time.monotonic()
+        unlisted: List[Tuple[float, float]] = []
+        with self._lock:
+            kept = []
+            for reservation in self._reservations:
+                if now - reservation.created >= RESERVATION_TTL_SECONDS:
+                    continue
+                executed, working = reservation.unlisted(positions, orders)
+                if executed + working <= _EPS:
+                    continue
+                kept.append(reservation)
+                unlisted.append((executed, working))
+            self._reservations = kept
+        return unlisted
 
 
 _default_guard: Optional[RiskGuard] = None

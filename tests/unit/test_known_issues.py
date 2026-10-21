@@ -10,7 +10,7 @@ import metatrader_client.risk as risk
 from metatrader_client.order import close_position, close_all_positions, place_market_order, send_order
 from metatrader_client.risk import RiskConfig, RiskGuard
 from metatrader_client.types import TradeRequestActions, TradeReturnCodes
-from .fakes import FakeMT5, make_position, with_risk
+from .fakes import FakeMT5, make_order, make_position, make_symbol, with_risk
 
 TIMEOUT = 5  # safety net only: the tests synchronize on events, never on sleeps
 
@@ -293,7 +293,7 @@ def test_mt5_003_unknown_outcome_keeps_reservation_and_blocks_duplicate(fake_mt5
     assert len(fake_mt5.sent) == 1
 
 
-def test_mt5_003_partial_fill_reserves_the_filled_volume(fake_mt5, connection):
+def test_mt5_003_partial_fill_with_fok_symbol_reserves_the_filled_volume(fake_mt5, connection):
     with_risk(connection, max_total_volume=0.15, duplicate_window_seconds=0)
     fake_mt5.results = [lambda request: fake_mt5.result_for(request, TradeReturnCodes.DONE_PARTIAL.value, volume=0.04)]
 
@@ -319,3 +319,94 @@ def test_mt5_003_reservation_expires(fake_mt5, connection, monkeypatch):
 
     assert place_market_order(connection, type="BUY", symbol="EURUSD", volume=0.1)["error"] is False
     assert place_market_order(connection, type="BUY", symbol="EURUSD", volume=0.2)["error"] is False
+
+
+# ---------------------------------------------------------------------------
+# MT5-003 follow-up (revision of PR #2): RETURN partial fills keep the remainder working
+# ---------------------------------------------------------------------------
+
+def partial_fill(fake_mt5, connection, *, exemode, filling_mask, max_total_volume=0.15):
+    """Send BUY 0.10 filled 0.04 on a symbol whose execution mode selects the given filling policy."""
+    fake_mt5.symbols["EURUSD"] = make_symbol(trade_exemode=exemode, filling_mode=filling_mask)
+    with_risk(connection, max_total_volume=max_total_volume, duplicate_window_seconds=0)
+    fake_mt5.results = [lambda request: fake_mt5.result_for(request, TradeReturnCodes.DONE_PARTIAL.value, volume=0.04)]
+    first = place_market_order(connection, type="BUY", symbol="EURUSD", volume=0.1)
+    assert first["status"] == "partial"
+    return first["data"].order, fake_mt5.sent[0]["type_filling"]
+
+
+def try_buy(connection, volume):
+    return place_market_order(connection, type="BUY", symbol="EURUSD", volume=volume)
+
+
+def test_review_reproduction_return_partial_with_delayed_listing(fake_mt5, connection):
+    ticket, filling = partial_fill(fake_mt5, connection, exemode=3, filling_mask=0)
+
+    assert filling == 2  # ORDER_FILLING_RETURN
+    # 0.04 executed + 0.06 still working = 0.10; another 0.10 would reach 0.20 > 0.15.
+    second = try_buy(connection, 0.1)
+    assert second["error"] is True
+    assert "Total exposure would be 0.2 lots" in second["message"]
+    assert try_buy(connection, 0.05)["error"] is False
+    assert len(fake_mt5.sent) == 2
+
+
+def test_ioc_partial_reserves_only_the_executed_volume(fake_mt5, connection):
+    ticket, filling = partial_fill(fake_mt5, connection, exemode=2, filling_mask=2)
+
+    assert filling == 1  # ORDER_FILLING_IOC: the server cancels the remainder
+    assert try_buy(connection, 0.11)["error"] is False  # 0.04 + 0.11 = 0.15
+    assert try_buy(connection, 0.01)["error"] is True
+
+
+def test_unknown_filling_policy_keeps_the_remainder(fake_mt5, connection):
+    fake_mt5.symbols["EURUSD"] = make_symbol(trade_exemode=3, filling_mode=0)
+    with_risk(connection, max_total_volume=0.15, duplicate_window_seconds=0)
+    fake_mt5.results = [lambda request: fake_mt5.result_for(request, TradeReturnCodes.DONE_PARTIAL.value, volume=0.04)]
+    send_order(connection, action=TradeRequestActions.DEAL, order_type="BUY", symbol="EURUSD", volume=0.1, type_filling=3)
+
+    assert try_buy(connection, 0.06)["error"] is True  # 0.10 kept + 0.06 > 0.15
+
+
+def test_working_remainder_listed_without_position_keeps_executed_budget(fake_mt5, connection):
+    ticket, _ = partial_fill(fake_mt5, connection, exemode=3, filling_mask=0)
+    fake_mt5.orders = [make_order(ticket, type=0, volume=0.06)]  # remainder listed, position not yet
+
+    # listed 0.06 + executed 0.04 still reserved = 0.10
+    assert try_buy(connection, 0.06)["error"] is True
+    assert try_buy(connection, 0.05)["error"] is False
+
+
+def test_position_and_remainder_listed_are_not_counted_twice(fake_mt5, connection):
+    ticket, _ = partial_fill(fake_mt5, connection, exemode=3, filling_mask=0)
+    fake_mt5.positions = [make_position(ticket, volume=0.04)]
+    fake_mt5.orders = [make_order(ticket, type=0, volume=0.06)]
+
+    assert try_buy(connection, 0.05)["error"] is False  # 0.04 + 0.06 listed + 0.05 = 0.15
+    assert connection.risk_guard._reservations[0].ticket != ticket  # the first reservation was released
+
+
+def test_position_listed_but_remainder_not_listed_keeps_the_remainder(fake_mt5, connection):
+    ticket, _ = partial_fill(fake_mt5, connection, exemode=3, filling_mask=0)
+    fake_mt5.positions = [make_position(ticket, volume=0.04)]
+
+    assert try_buy(connection, 0.06)["error"] is True  # 0.04 listed + 0.06 working + 0.06 > 0.15
+
+
+def test_remainder_filled_into_the_position_is_not_counted_twice(fake_mt5, connection):
+    ticket, _ = partial_fill(fake_mt5, connection, exemode=3, filling_mask=0)
+    fake_mt5.positions = [make_position(ticket, volume=0.10)]  # remainder filled, no active order
+
+    assert try_buy(connection, 0.05)["error"] is False  # 0.10 listed + 0.05 = 0.15
+
+
+def test_return_partial_reserves_a_slot_for_position_and_order(fake_mt5, connection):
+    fake_mt5.symbols["EURUSD"] = make_symbol(trade_exemode=3, filling_mode=0)
+    with_risk(connection, max_open_positions=2, duplicate_window_seconds=0)
+    fake_mt5.results = [lambda request: fake_mt5.result_for(request, TradeReturnCodes.DONE_PARTIAL.value, volume=0.04)]
+    try_buy(connection, 0.1)
+
+    # The terminal will list a position and an order for this ticket: both slots are taken.
+    result = try_buy(connection, 0.1)
+    assert result["error"] is True
+    assert "2 recently sent and not listed yet" in result["message"]
