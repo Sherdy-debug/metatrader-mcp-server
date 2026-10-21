@@ -9,7 +9,10 @@ import argparse
 import uvicorn
 from dotenv import load_dotenv
 from metatrader_mcp.utils import init
+from metatrader_mcp.security import BearerTokenMiddleware, check_network_security, env_flag
 from contextlib import asynccontextmanager
+
+load_dotenv()
 
 # Instantiate settings
 settings = Settings()
@@ -39,14 +42,23 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Enable CORS for Open WebUI and other clients
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Cross-origin access is disabled unless origins are listed in OPENAPI_CORS_ORIGINS
+# (comma separated). A wildcard would let any web page open in a browser on this
+# machine send orders to the local API.
+cors_origins = [o.strip() for o in os.getenv("OPENAPI_CORS_ORIGINS", "").split(",") if o.strip()]
+if cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+
+# Bearer token authentication, required when listening on a non-loopback address.
+auth_token = os.getenv("OPENAPI_AUTH_TOKEN") or None
+if auth_token:
+    app.add_middleware(BearerTokenMiddleware, token=auth_token)
 
 # Include API routers
 def strip_prefix(route: APIRoute) -> str:
@@ -66,7 +78,21 @@ def main():
     parser.add_argument("--path", default=None, help="Path to MT5 terminal executable (optional, auto-detected if not provided)")
     parser.add_argument("--host", default="127.0.0.1", help="Bind host")
     parser.add_argument("--port", type=int, default=8000, help="Bind port")
+    parser.add_argument("--ssl-certfile", default=os.getenv("OPENAPI_SSL_CERTFILE"), help="TLS certificate file (env: OPENAPI_SSL_CERTFILE)")
+    parser.add_argument("--ssl-keyfile", default=os.getenv("OPENAPI_SSL_KEYFILE"), help="TLS private key file (env: OPENAPI_SSL_KEYFILE)")
     args = parser.parse_args()
+
+    try:
+        check_network_security(
+            args.host,
+            token=auth_token,
+            ssl_certfile=args.ssl_certfile,
+            ssl_keyfile=args.ssl_keyfile,
+            allow_insecure_remote=env_flag("OPENAPI_ALLOW_INSECURE_REMOTE"),
+            token_env="OPENAPI_AUTH_TOKEN",
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # set both uppercase and lowercase env vars for CLI
     os.environ["LOGIN"] = args.login
@@ -79,10 +105,11 @@ def main():
         os.environ["MT5_PATH"] = args.path
 
     uvicorn.run(
-        "metatrader_openapi.main:app",
+        app,
         host=args.host,
         port=args.port,
-        reload=True,
+        ssl_certfile=args.ssl_certfile,
+        ssl_keyfile=args.ssl_keyfile,
     )
 
 if __name__ == "__main__":

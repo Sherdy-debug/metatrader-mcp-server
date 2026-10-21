@@ -138,16 +138,17 @@ Pick one based on how you want to use it:
   "mcpServers": {
     "metatrader": {
       "command": "metatrader-mcp-server",
-      "args": [
-        "--login",     "YOUR_MT5_LOGIN",
-        "--password",  "YOUR_MT5_PASSWORD",
-        "--server",    "YOUR_MT5_SERVER",
-        "--transport", "stdio"
-      ]
+      "env": {
+        "LOGIN":    "YOUR_MT5_LOGIN",
+        "PASSWORD": "YOUR_MT5_PASSWORD",
+        "SERVER":   "YOUR_MT5_SERVER"
+      }
     }
   }
 }
 ```
+
+STDIO is the default transport: the server is only reachable by the application that launches it. Credentials can also be passed with `--login`, `--password` and `--server`, but command-line arguments are visible to other processes, so environment variables are preferred.
 
 **Optional: Specify Custom MT5 Terminal Path**
 
@@ -181,15 +182,17 @@ If your MT5 terminal is installed in a non-standard location, add the `--path` a
 1. Start the HTTP server:
 
 ```bash
-metatrader-http-server --login YOUR_LOGIN --password YOUR_PASSWORD --server YOUR_SERVER --host 0.0.0.0 --port 8000
+metatrader-http-server --login YOUR_LOGIN --password YOUR_PASSWORD --server YOUR_SERVER --port 8000
 ```
+
+The API listens on `127.0.0.1` and rejects cross-origin requests unless their origins are listed in `OPENAPI_CORS_ORIGINS`. To listen on another address, set `OPENAPI_AUTH_TOKEN` (32+ characters, sent as `Authorization: Bearer <token>`) and provide TLS with `--ssl-certfile`/`--ssl-keyfile`, or set `OPENAPI_ALLOW_INSECURE_REMOTE=true` if a reverse proxy terminates TLS.
 
 **Optional: Specify Custom MT5 Terminal Path**
 
 If your MT5 terminal is installed in a non-standard location, add the `--path` argument:
 
 ```bash
-metatrader-http-server --login YOUR_LOGIN --password YOUR_PASSWORD --server YOUR_SERVER --path "C:\Program Files\MetaTrader 5\terminal64.exe" --host 0.0.0.0 --port 8000
+metatrader-http-server --login YOUR_LOGIN --password YOUR_PASSWORD --server YOUR_SERVER --path "C:\Program Files\MetaTrader 5\terminal64.exe" --port 8000
 ```
 
 2. Open your browser to `http://localhost:8000/docs` to see the API documentation
@@ -218,37 +221,39 @@ websocat ws://localhost:8765
 
 You'll receive a `connected` message followed by continuous tick updates as JSON. See [WebSocket Quote Server](#-websocket-quote-server) for full details.
 
-#### Option D: Remote MCP Server (SSE)
+#### Option D: Remote MCP Server (SSE or streamable HTTP)
 
 Run the MCP server on a Windows VPS (where MT5 is installed) and connect to it remotely from Claude Desktop or Claude Code.
 
-**Server-side** (on the Windows VPS):
+Network transports are opt-in and protected:
 
-```bash
-metatrader-mcp-server --login YOUR_LOGIN --password YOUR_PASSWORD --server YOUR_SERVER
+- On `127.0.0.1` (default host) no extra configuration is needed.
+- On any other address the server refuses to start unless `MCP_AUTH_TOKEN` is set (at least 32 random characters). Every request must send `Authorization: Bearer <token>`.
+- It also requires TLS (`--ssl-certfile` and `--ssl-keyfile`), unless `MCP_ALLOW_INSECURE_REMOTE=true` declares that a reverse proxy terminates TLS.
+
+**Server-side** (on the Windows VPS, PowerShell):
+
+```powershell
+$env:MCP_AUTH_TOKEN = python -c "import secrets; print(secrets.token_urlsafe(32))"
+metatrader-mcp-server --transport sse --host 0.0.0.0 --port 8080 --ssl-certfile cert.pem --ssl-keyfile key.pem
 ```
 
-This starts the SSE server on `0.0.0.0:8080` by default. Customize with `--host` and `--port`:
+Optionally restrict the accepted `Host` headers with `MCP_ALLOWED_HOSTS` (comma separated, e.g. `mt5.example.com:8080`).
 
-```bash
-metatrader-mcp-server --login YOUR_LOGIN --password YOUR_PASSWORD --server YOUR_SERVER --host 127.0.0.1 --port 9000
-```
-
-**Client-side** (Claude Desktop config on your local machine):
+**Client-side** (configuration on your local machine):
 
 ```json
 {
   "mcpServers": {
     "metatrader": {
-      "url": "http://VPS_IP:8080/sse"
+      "url": "https://VPS_HOST:8080/sse",
+      "headers": { "Authorization": "Bearer YOUR_TOKEN" }
     }
   }
 }
 ```
 
-Replace `VPS_IP` with your server's IP address.
-
-> **Security Warning**: The MCP protocol does not include authentication. When exposing the SSE server over a network, use a firewall to restrict access by IP, or place it behind a reverse proxy with authentication, or use an SSH tunnel.
+An SSH tunnel to a server bound to `127.0.0.1` is a simpler alternative that needs no token or certificate.
 
 ---
 
@@ -325,7 +330,7 @@ The WebSocket Quote Server streams real-time tick data from MetaTrader 5 to any 
 metatrader-quote-server --login YOUR_LOGIN --password YOUR_PASSWORD --server YOUR_SERVER
 ```
 
-The server starts on `ws://0.0.0.0:8765` by default.
+The server starts on `ws://127.0.0.1:8765` by default. Use `--host 0.0.0.0` only on a trusted network: the quote stream has no authentication.
 
 ### Customization
 
@@ -344,7 +349,7 @@ metatrader-quote-server \
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--host` | `QUOTE_HOST` | `0.0.0.0` | Host to bind |
+| `--host` | `QUOTE_HOST` | `127.0.0.1` | Host to bind |
 | `--port` | `QUOTE_PORT` | `8765` | Port to bind |
 | `--symbols` | `QUOTE_SYMBOLS` | `XAUUSD,USOIL,GBPUSD,USDJPY,EURUSD,BTCUSD` | Comma-separated symbols to stream |
 | `--poll-interval` | `QUOTE_POLL_INTERVAL_MS` | `100` | Tick polling interval in milliseconds |
@@ -564,11 +569,47 @@ The MCP server supports multiple transport modes:
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--transport` | `MCP_TRANSPORT` | `sse` | Transport type: `sse`, `stdio`, `streamable-http` |
-| `--host` | `MCP_HOST` | `0.0.0.0` | Host to bind (SSE/HTTP only) |
+| `--transport` | `MCP_TRANSPORT` | `stdio` | Transport type: `stdio`, `sse`, `streamable-http` |
+| `--host` | `MCP_HOST` | `127.0.0.1` | Host to bind (SSE/HTTP only) |
 | `--port` | `MCP_PORT` | `8080` | Port to bind (SSE/HTTP only) |
+| | `MCP_AUTH_TOKEN` | | Bearer token, required for non-loopback hosts |
+| `--ssl-certfile` / `--ssl-keyfile` | `MCP_SSL_CERTFILE` / `MCP_SSL_KEYFILE` | | TLS, required for non-loopback hosts |
+| | `MCP_ALLOW_INSECURE_REMOTE` | `false` | Accept a non-loopback host without TLS (TLS terminated by a proxy) |
+| | `MCP_ALLOWED_HOSTS` | | Accepted `Host` headers for DNS rebinding protection |
 
 CLI flags take precedence over environment variables, which take precedence over defaults.
+
+### Trading Safety Controls
+
+Risk limits are enforced in code on every request that opens exposure, independently of the AI agent. Closing positions and cancelling orders are never blocked by exposure limits.
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `MT5_ALLOW_LIVE_TRADING` | `false` | Trading is only allowed on **demo** accounts unless this is `true` |
+| `MT5_MAX_VOLUME_PER_ORDER` | | Maximum lots per order |
+| `MT5_MAX_TOTAL_VOLUME` | | Maximum lots across open positions and pending orders |
+| `MT5_MAX_OPEN_POSITIONS` | | Maximum number of open positions plus pending orders |
+| `MT5_MAX_RISK_PER_TRADE_PCT` | | Maximum loss at the stop loss, in % of equity (requires a stop loss) |
+| `MT5_REQUIRE_STOP_LOSS` | `false` | Reject orders without stop loss and the removal of a stop loss |
+| `MT5_MAX_DAILY_LOSS` | | Block new exposure once today's realized + floating loss reaches this amount (account currency, day of the trade server) |
+| `MT5_DUPLICATE_WINDOW_SECONDS` | `10` | Reject a request identical to one sent within this window (`0` disables) |
+
+The same settings can be passed to `MT5Client` as `config["risk"] = {"max_daily_loss": 200, ...}`.
+
+Every request is also validated against the symbol specification (minimum, maximum and step of volume, price digits and tick size, minimum stop distance), and the filling mode is chosen from the symbol execution mode.
+
+Trading results include `status` and `retcode`. Only `error: false` means the request was executed:
+
+| `status` | Meaning |
+|----------|---------|
+| `done` | Completed (filled, modified, canceled) |
+| `partial` | Filled for part of the volume |
+| `placed` | Order accepted and waiting (pending orders) |
+| `no_changes` | The request matched the current state |
+| `rejected` | Rejected locally or by the trade server; see `retcode` and `message` |
+| `no_response` | The terminal did not answer: check positions and orders before retrying |
+
+Bulk operations (`close_all_*`, `cancel_all_*`) return the result of every item and the tickets still present afterwards.
 
 ### Custom Port and Host (HTTP API)
 
@@ -742,7 +783,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📊 Project Stats
 
-- **Version**: 0.5.1
+- **Version**: 0.6.0
 - **Python**: 3.10+
 - **License**: MIT
 - **Status**: Active Development

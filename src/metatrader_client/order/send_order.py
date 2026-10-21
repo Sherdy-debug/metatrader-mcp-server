@@ -7,18 +7,87 @@ modification of positions and orders, and position closing.
 """
 
 import MetaTrader5 as mt5
-import pandas as pd
 from typing import Optional, Union, Dict
 from datetime import datetime
 
-from ..client_market import MT5Market
+from ..risk import get_risk_guard
 from ..types import (
-	TradeRequest,
 	TradeRequestActions,
 	OrderType,
 	OrderFilling,
 	OrderTime
 )
+from ._result import interpret_order_result, failure, STATUS_NO_RESPONSE, SUCCESS_STATUSES
+from ._validation import (
+	is_buy,
+	select_filling_mode,
+	validate_volume,
+	normalize_price,
+	check_stops,
+	check_pending_price,
+)
+
+PENDING_TYPES = (
+	OrderType.BUY_LIMIT.value,
+	OrderType.SELL_LIMIT.value,
+	OrderType.BUY_STOP.value,
+	OrderType.SELL_STOP.value,
+)
+
+
+def _to_code(enum_cls, value) -> Optional[int]:
+	"""Convert an enum member, name or numeric code to its numeric code."""
+	if value is None:
+		return None
+	if isinstance(value, int) and not isinstance(value, bool):
+		return value if enum_cls.exists(value) else None
+	return enum_cls.validate(value)
+
+
+def _optional_level(value) -> Optional[float]:
+	"""Convert an optional SL/TP level, where None and 0 mean no level."""
+	if value is None:
+		return None
+	value = float(value)
+	return value if value != 0 else None
+
+
+def _load_symbol(symbol: Optional[str]):
+	"""Select a symbol and return (symbol_info, tick, error)."""
+	if not symbol:
+		return None, None, "Parameter `symbol` is required for this operation"
+	if not mt5.symbol_select(symbol, True):
+		return None, None, f"Invalid symbol or failed to select {symbol}"
+	symbol_info = mt5.symbol_info(symbol)
+	if symbol_info is None:
+		return None, None, f"Failed to get symbol info for {symbol}"
+	tick = mt5.symbol_info_tick(symbol)
+	if tick is None or not tick.bid or not tick.ask:
+		return symbol_info, None, f"No current quote for {symbol}"
+	return symbol_info, tick, None
+
+
+def _normalize_levels(symbol_info, stop_loss, take_profit):
+	"""Normalize optional SL/TP to the symbol precision. Returns (sl, tp, error)."""
+	levels = []
+	for label, value in (("Stop loss", stop_loss), ("Take profit", take_profit)):
+		value = _optional_level(value)
+		if value is not None:
+			value, error = normalize_price(symbol_info, value, label)
+			if error:
+				return None, None, error
+		levels.append(value)
+	return levels[0], levels[1], None
+
+
+def _send(request: Dict, guard=None, duplicate_key=None) -> Dict:
+	"""Send a request and interpret its result, remembering it for duplicate detection."""
+	response = interpret_order_result(mt5, mt5.order_send(request), request)
+	if guard is not None and duplicate_key is not None:
+		# A request with an unknown outcome is remembered too: retrying it blindly could open twice.
+		if response["status"] in SUCCESS_STATUSES or response["status"] == STATUS_NO_RESPONSE:
+			guard.record(duplicate_key)
+	return response
 
 
 def send_order(
@@ -28,322 +97,266 @@ def send_order(
 	symbol: Optional[str] = None,
 	volume: Optional[float] = None,
 	order_type: Optional[Union[str, int, OrderType]] = None,
-	price: Optional[float] = 0.0,
-	stop_loss: Optional[float] = 0.0,
-	take_profit: Optional[float] = 0.0,
+	price: Optional[float] = None,
+	stop_loss: Optional[float] = None,
+	take_profit: Optional[float] = None,
 	deviation: Optional[int] = 20,
 	magic: Optional[int] = 0,
 	comment: Optional[str] = "",
-	position: Optional[int] = 0,
-	position_by: Optional[int] = 0,
-	order: Optional[int] = 0,
+	position: Optional[int] = None,
+	position_by: Optional[int] = None,
+	order: Optional[int] = None,
 	expiration: Optional[datetime] = None,
 	type_filling: Optional[Union[str, int, OrderFilling]] = None,
 	type_time: Optional[Union[str, int, OrderTime]] = None,
-	stoplimit: Optional[float] = 0.0
+	stoplimit: Optional[float] = None
 ) -> Dict:
 	"""
 	Send a trading order to MetaTrader 5.
-	
-	This function creates and sends a trading request to MetaTrader 5 using the order_send
-	function. It supports all types of trading operations including market orders, pending
-	orders, position modifications, and order cancellations.
-	
+
+	The request is validated against the symbol specification (volume limits
+	and step, price precision, minimal stop distance) and against the risk
+	limits configured for the connection before it is sent. The result of
+	``order_send`` is then interpreted from its ``retcode``.
+
 	Args:
 		connection: MetaTrader 5 connection object
 		action: Trading operation type (DEAL, PENDING, SLTP, MODIFY, REMOVE, CLOSE_BY)
 		symbol: Trading instrument name (e.g., "EURUSD")
 		volume: Trade volume in lots
 		order_type: Order type (BUY, SELL, BUY_LIMIT, etc.)
-		price: Order price (required for pending orders, ignored for market in some execution modes)
-		stop_loss: Stop Loss level (optional)
-		take_profit: Take Profit level (optional)
+		price: Order price. Required for PENDING and MODIFY; for DEAL the current quote is used when omitted
+		stop_loss: Stop Loss level. None or 0 means no stop loss
+		take_profit: Take Profit level. None or 0 means no take profit
 		deviation: Maximum acceptable price deviation in points (for market orders)
 		magic: Expert Advisor ID (magic number)
 		comment: Order comment
-		position: Position ticket (required for position operations)
+		position: Position ticket (required for SLTP, and to close a position with DEAL)
 		position_by: Opposite position ticket (for CLOSE_BY operations)
-		order: Order ticket (required for order modification)
-		expiration: Order expiration time (for orders with type_time=SPECIFIED)
-		type_filling: Order filling type (FOK, IOC, RETURN)
-		type_time: Order lifetime type (GTC, DAY, SPECIFIED)
+		order: Order ticket (required for MODIFY and REMOVE)
+		expiration: Order expiration time (for pending orders)
+		type_filling: Order filling type; selected from the symbol settings when omitted
+		type_time: Order lifetime type (GTC, DAY, SPECIFIED, SPECIFIED_DAY)
 		stoplimit: Stop limit price (for STOP_LIMIT orders)
-	
+
 	Returns:
 		Dictionary containing:
-		- 'success': Boolean indicating if the operation was successful
+		- 'success': True when the request was completed, partially completed or placed
+		- 'status': 'done', 'partial', 'placed', 'no_changes', 'rejected' or 'no_response'
+		- 'retcode' / 'retcode_name': Trade server return code, None if the request was not sent
 		- 'message': Human-readable message describing the result
-		
+		- 'data': Raw order_send result, None if the request was not sent
+		- 'request': The request that was sent
+
 	Notes:
 		Different parameters are required depending on the action:
-		- DEAL (market order): symbol, volume, order_type (BUY/SELL)
+		- DEAL (market order): symbol, volume, order_type (BUY/SELL); position to close a position
 		- PENDING: symbol, volume, price, order_type
-		- SLTP: position, sl and/or tp
-		- MODIFY: order, and new parameters to modify
+		- SLTP: position, sl and tp (both are sent; pass the current value to keep it)
+		- MODIFY: order, price, sl and tp (all are sent; pass the current value to keep it)
 		- REMOVE: order
-		- CLOSE_BY: position, position_by
+		- CLOSE_BY: not supported
 	"""
-	_market = MT5Market(connection)
-
-	# Validate action
-	action = TradeRequestActions.validate(action)
-	
-	# Validate order type
-	order_type = OrderType.validate(order_type)
-
-	# Validate symbol
-	if symbol is not None:
-		if (len(_market.get_symbols(symbol)) == 0):
-			return { "success": False, "message": "Invalid symbol" }
-		# Ensure symbol is available
-		if not mt5.symbol_select(symbol, True):
-			return { "success": False, "message": f"Failed to select {symbol}", "data": None }
-		# Get symbol info
-		symbol_info = mt5.symbol_info(symbol)
-		if symbol_info is None:
-			return { "success": False, "message": f"Failed to get symbol info for {symbol}", "data": None }
-		# Fetch broker-supported filling modes
-		filling_mask = symbol_info.filling_mode
-		filling_to_enum = {
-			1: mt5.ORDER_FILLING_FOK,
-			2: mt5.ORDER_FILLING_IOC,
-			4: mt5.ORDER_FILLING_RETURN
-		}
-		for flag, enum in filling_to_enum.items():
-			if filling_mask & flag:
-				selected_filling = enum
-				break
-
-	# Validate volume
-	if volume is not None:
-		if (volume <= 0 or volume > 100 or volume == 0):
-			return { "success": False, "message": "Invalid volume", "data": None }
-		else:
-			volume = float(volume)
-
-	# Validate price
-	price = float(price)
-	if not isinstance(price, float):
-		return { "success": False, "message": "Invalid price" }
-
-	# Validate TP and SL
-	if stop_loss != 0:
-		stop_loss = float(stop_loss)
-		if not isinstance(stop_loss, float):
-			return { "success": False, "message": "Invalid SL or TP" }
-	if take_profit != 0:
-		take_profit = float(take_profit)
-		if not isinstance(take_profit, float):
-			return { "success": False, "message": "Invalid SL or TP" }
-		
-	if order_type in [OrderType.BUY, OrderType.BUY_LIMIT, OrderType.BUY_STOP]:
-		if (stop_loss != 0) and (stop_loss >= price):
-			return { "success": False, "message": "Stop loss must be less than price" }
-		if (take_profit != 0) and (take_profit <= price):
-			return { "success": False, "message": "Take profit must be higher than the price" }
-		if (stop_loss != 0) and (take_profit != 0) and (stop_loss > take_profit):
-			return { "success": False, "message": "Stop loss must be less than take profit" }
-		
-	elif order_type in [OrderType.SELL, OrderType.SELL_LIMIT, OrderType.SELL_STOP]:
-		if (stop_loss != 0) and (stop_loss <= price):
-			return { "success": False, "message": "Stop loss must be above the price" }
-		if (take_profit != 0) and (take_profit >= price):
-			return { "success": False, "message": "Take profit must be below the price" }
-		if (stop_loss != 0 and take_profit != 0) and (stop_loss < take_profit):
-			return { "success": False, "message": "Stop loss must be above the take profit" }
-
-	# Comment
+	action = _to_code(TradeRequestActions, action)
+	if action is None:
+		return failure("Invalid trade action")
+	order_type = _to_code(OrderType, order_type)
 	comment = comment if comment else "MCP"
+	guard = get_risk_guard(connection)
 
-	match action:
+	error = guard.check_account(mt5)
+	if error:
+		return failure(error)
 
-		# ------------------------------
-		# Market execution (BUY or SELL)
-		# ------------------------------
-		case TradeRequestActions.DEAL:
-			
-			if order_type not in [OrderType.BUY, OrderType.SELL]:
-				return { "success": False, "message": "Invalid order type, must be BUY or SELL", "data": None }
+	# ------------------------------
+	# Market execution (BUY or SELL)
+	# ------------------------------
+	if action == TradeRequestActions.DEAL.value:
 
-			# Ensure the price is not zero
-			if price == 0:
-				tick = mt5.symbol_info_tick(symbol)
-				if tick is None:
-					return { "success": False, "message": "Failed to get tick for {symbol}", "data": None }
-				price = tick.ask if order_type == OrderType.BUY else tick.bid
-				# Round to broker's precision
-				digits = symbol_info.digits
-				price = round(price, digits)
+		if order_type not in (OrderType.BUY.value, OrderType.SELL.value):
+			return failure("Invalid order type, must be BUY or SELL")
+		closing = bool(position)
 
-			request = {
-				"symbol": symbol,
-				"volume": volume,
-				"type": order_type,
-				"price": price,
-				"action": action,
-				"type_filling": selected_filling,
-				"comment": comment,
-				"sl": stop_loss,
-				"tp": take_profit,
-				"deviation": 20,
-				"position": position
-			}
+		symbol_info, tick, error = _load_symbol(symbol)
+		if error:
+			return failure(error)
 
-			if position is None:
-				del request["position"]
-			else:
-				pass
-			
-			response = mt5.order_send(request)
+		volume, error = validate_volume(symbol_info, volume)
+		if error:
+			return failure(error)
 
-			error_code, error_description = mt5.last_error()
-			
-			if error_code < 0:
-				return { "success": False, "message": f"Error {error_code}: {error_description}", "data": None }
+		# The quote is read before validating SL/TP, so they are compared with the real price.
+		if price:
+			price, error = normalize_price(symbol_info, price)
+			if error:
+				return failure(error)
+		else:
+			price = tick.ask if order_type == OrderType.BUY.value else tick.bid
 
-			return { "success": True, "message": "Order sent successfully", "data": response }
+		stop_loss, take_profit, error = _normalize_levels(symbol_info, stop_loss, take_profit)
+		if error:
+			return failure(error)
+		if not closing:
+			# A new position is closed at bid (buy) or ask (sell): stops are measured from that price.
+			reference = tick.bid if order_type == OrderType.BUY.value else tick.ask
+			error = check_stops(symbol_info, order_type, reference_price=reference, stop_loss=stop_loss, take_profit=take_profit)
+			if error:
+				return failure(error)
 
-		# ----------------------------------------------------------
-		# Pending order (BUY_LIMIT, SELL_LIMIT, BUY_STOP, SELL_STOP)
-		# ----------------------------------------------------------
-		case TradeRequestActions.PENDING:
+		filling = _to_code(OrderFilling, type_filling)
+		if filling is None:
+			filling, error = select_filling_mode(symbol_info, pending=False)
+			if error:
+				return failure(error)
 
-			if order_type not in [OrderType.BUY_LIMIT, OrderType.SELL_LIMIT, OrderType.BUY_STOP, OrderType.SELL_STOP]:
-				return { "success": False, "message": "Invalid order type, must be BUY_LIMIT, SELL_LIMIT, BUY_STOP, or SELL_STOP", "data": None }
+		request = {
+			"action": action,
+			"symbol": symbol,
+			"volume": volume,
+			"type": order_type,
+			"price": price,
+			"sl": stop_loss or 0.0,
+			"tp": take_profit or 0.0,
+			"deviation": int(deviation if deviation is not None else 20),
+			"magic": int(magic or 0),
+			"comment": comment,
+			"type_time": OrderTime.GTC.value,
+			"type_filling": filling,
+		}
+		if closing:
+			request["position"] = int(position)
+			return _send(request)
 
-			tick = mt5.symbol_info_tick(symbol)
-			if tick is not None:
-				match order_type:
-					case OrderType.BUY_LIMIT:
-						if price > tick.ask:
-							return { "success": False, "message": "Invalid price, must be above current ask", "data": None }
-					case OrderType.SELL_LIMIT:
-						if price < tick.bid:
-							return { "success": False, "message": "Invalid price, must be below current bid", "data": None }
-					case OrderType.BUY_STOP:
-						if price < tick.ask:
-							return { "success": False, "message": "Invalid price, must be above current ask", "data": None }
-					case OrderType.SELL_STOP:
-						if price > tick.bid:
-							return { "success": False, "message": "Invalid price, must be below current bid", "data": None }
+		error = guard.check_new_order(mt5, symbol=symbol, side=order_type, volume=volume, entry_price=price, stop_loss=stop_loss)
+		if error:
+			return failure(error)
+		duplicate_key = ("DEAL", symbol, order_type, volume, stop_loss, take_profit)
+		error = guard.check_duplicate(duplicate_key)
+		if error:
+			return failure(error)
+		return _send(request, guard, duplicate_key)
 
-			request = {
-				"action": action,
-				"symbol": symbol,
-				"volume": volume,
-				"type": order_type,
-				"price": price,
-				"sl": stop_loss,
-				"tp": take_profit,
-				"deviation": deviation,
-				"comment": comment,
-				"type_time": OrderTime.SPECIFIED.value if expiration else OrderTime.GTC.value,
-				"expiration": expiration if expiration else 0,
-				"type_filling": selected_filling,
-			}
+	# ----------------------------------------------------------
+	# Pending order (BUY_LIMIT, SELL_LIMIT, BUY_STOP, SELL_STOP)
+	# ----------------------------------------------------------
+	if action == TradeRequestActions.PENDING.value:
 
-			response = mt5.order_send(request)
+		if order_type not in PENDING_TYPES:
+			return failure("Invalid order type, must be BUY_LIMIT, SELL_LIMIT, BUY_STOP, or SELL_STOP")
 
-			error_code, error_description = mt5.last_error()
-			if error_code < 0:
-				return { "success": False, "message": f"Error {error_code}: {error_description}", "data": None }
-			return { "success": True, "message": "Order sent successfully", "data": response }
+		symbol_info, tick, error = _load_symbol(symbol)
+		if error:
+			return failure(error)
 
-		# --------------------
-		# Modify order (SL/TP)
-		# --------------------    
-		case TradeRequestActions.SLTP:
+		volume, error = validate_volume(symbol_info, volume)
+		if error:
+			return failure(error)
 
-			if position is None:
-				return {
-					"success": False,
-					"message": f"Parameter `position` is required for this operation",
-					"data": None,
-				}
+		price, error = normalize_price(symbol_info, price)
+		if error:
+			return failure(error)
+		error = check_pending_price(symbol_info, order_type, price=price, bid=tick.bid, ask=tick.ask)
+		if error:
+			return failure(error)
 
-			request = {
-				"action": action,
-				"position": position,
-				"sl": stop_loss,
-				"tp": take_profit,
-				"comment": comment,
-			}
+		stop_loss, take_profit, error = _normalize_levels(symbol_info, stop_loss, take_profit)
+		if error:
+			return failure(error)
+		error = check_stops(symbol_info, order_type, reference_price=price, stop_loss=stop_loss, take_profit=take_profit)
+		if error:
+			return failure(error)
 
-			response = mt5.order_send(request)
+		filling = _to_code(OrderFilling, type_filling)
+		if filling is None:
+			filling, _ = select_filling_mode(symbol_info, pending=True)
 
-			error_code, error_description = mt5.last_error()
-			if error_code < 0:
-				return { "success": False, "message": f"Error {error_code}: {error_description}", "data": None }
-			return { "success": True, "message": "Order sent successfully", "data": response }
-			
-		# ------------
-		# Modify order
-		# ------------
-		case TradeRequestActions.MODIFY:
+		lifetime = _to_code(OrderTime, type_time)
+		if lifetime is None:
+			lifetime = OrderTime.SPECIFIED.value if expiration else OrderTime.GTC.value
 
-			if order is None:
-				return {
-					"success": False,
-					"message": f"Parameter `order` is required for this operation",
-					"data": None,
-				}
-			
-			request = {
-				"action": action,
-				"order": order,
-				"price": price,
-				"sl": stop_loss,
-				"tp": take_profit,
-			}
+		request = {
+			"action": action,
+			"symbol": symbol,
+			"volume": volume,
+			"type": order_type,
+			"price": price,
+			"sl": stop_loss or 0.0,
+			"tp": take_profit or 0.0,
+			"deviation": int(deviation if deviation is not None else 20),
+			"magic": int(magic or 0),
+			"comment": comment,
+			"type_time": lifetime,
+			"type_filling": filling,
+		}
+		if expiration:
+			request["expiration"] = expiration
 
-			if price is None:
-				del request["price"]
-			if stop_loss is None:
-				del request["sl"]
-			if take_profit is None:
-				del request["tp"]
+		side = OrderType.BUY.value if is_buy(order_type) else OrderType.SELL.value
+		error = guard.check_new_order(mt5, symbol=symbol, side=side, volume=volume, entry_price=price, stop_loss=stop_loss)
+		if error:
+			return failure(error)
+		duplicate_key = ("PENDING", symbol, order_type, volume, price, stop_loss, take_profit)
+		error = guard.check_duplicate(duplicate_key)
+		if error:
+			return failure(error)
+		return _send(request, guard, duplicate_key)
 
-			mt5.order_send(request)
+	# -----------------------
+	# Modify position (SL/TP)
+	# -----------------------
+	if action == TradeRequestActions.SLTP.value:
 
-			error_code, error_description = mt5.last_error()
-			if error_code < 0:
-				return { "success": False, "message": f"Error {error_code}: {error_description}", "data": None }
-			return { "success": True, "message": "Order sent successfully", "data": None }
+		if not position:
+			return failure("Parameter `position` is required for this operation")
+		if stop_loss is None or take_profit is None:
+			return failure("Parameters `stop_loss` and `take_profit` are required; pass the current value to keep it")
 
-		#----------------------
-		#  Remove pending order
-		# ---------------------
-		case TradeRequestActions.REMOVE:
+		request = {
+			"action": action,
+			"position": int(position),
+			"sl": float(stop_loss),
+			"tp": float(take_profit),
+		}
+		if symbol:
+			request["symbol"] = symbol
+		return _send(request)
 
-			if order is None:
-				return {
-					"success": False,
-					"message": f"Parameter `order` is required for this operation",
-					"data": None,
-				}
-			
-			request = {
-				"action": action,
-				"order": order,
-			}
+	# --------------------
+	# Modify pending order
+	# --------------------
+	if action == TradeRequestActions.MODIFY.value:
 
-			response = mt5.order_send(request)
+		if not order:
+			return failure("Parameter `order` is required for this operation")
+		if price is None or stop_loss is None or take_profit is None:
+			return failure("Parameters `price`, `stop_loss` and `take_profit` are required; pass the current value to keep it")
 
-			error_code, error_description = mt5.last_error()
-			if error_code < 0:
-				return { "success": False, "message": f"Error {error_code}: {error_description}", "data": None }
-			return { "success": True, "message": "Order sent successfully", "data": response }
+		request = {
+			"action": action,
+			"order": int(order),
+			"price": float(price),
+			"sl": float(stop_loss),
+			"tp": float(take_profit),
+		}
+		lifetime = _to_code(OrderTime, type_time)
+		if lifetime is not None:
+			request["type_time"] = lifetime
+		if expiration:
+			request["expiration"] = expiration
+		if stoplimit:
+			request["stoplimit"] = float(stoplimit)
+		if symbol:
+			request["symbol"] = symbol
+		return _send(request)
 
-		# --------
-		# Close by
-		# --------   
-		case TradeRequestActions.CLOSE_BY:
-			print("CLOSE BY")
+	# --------------------
+	# Remove pending order
+	# --------------------
+	if action == TradeRequestActions.REMOVE.value:
 
-	return {
-		'success': False,
-		'return_code': -1,
-		'return_message': 'Unknown error',
-		'request': None,
-		'result': None
-	}
+		if not order:
+			return failure("Parameter `order` is required for this operation")
+
+		return _send({"action": action, "order": int(order)})
+
+	return failure(f"Unsupported trade action {TradeRequestActions.to_string(action)}")

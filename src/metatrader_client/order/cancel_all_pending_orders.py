@@ -1,16 +1,27 @@
-from .get_all_pending_orders import get_all_pending_orders
+import MetaTrader5 as mt5
 from .cancel_pending_order import cancel_pending_order
+from ._bulk import run_bulk
 
 def cancel_all_pending_orders(connection):
     """
-    Cancels all pending orders.
+    Cancel all pending orders.
 
-    :param connection: MetaTrader 5 connection object.
-    :return: A dictionary with the result of the operation.
+    Every item is processed and reported individually, then the terminal is
+    queried again to detect items that are still present.
+
+    Args:
+        connection: The connection object to the MetaTrader platform.
+
+    Returns:
+        A dictionary with ``error`` (True if any item failed or remains),
+        ``message`` and ``data`` with the per-item results.
     """
-    pending_orders = get_all_pending_orders(connection)
-    cancel_count = 0
-    for id in pending_orders["id"]:
-        cancel_pending_order(connection, id)
-        cancel_count += 1
-    return { "error": False, "message": f"Cancel {cancel_count} pending orders success", "data": None }
+    items = mt5.orders_get()
+    return run_bulk(
+        items,
+        lambda ticket: cancel_pending_order(connection, ticket),
+        lambda: mt5.orders_get(),
+        verb="Canceled",
+        noun="pending orders",
+        error=mt5.last_error,
+    )

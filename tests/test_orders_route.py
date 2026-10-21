@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 # Mock for the MT5Client instance and its methods
 @pytest.fixture
-def mock_mt5_client_order_methods(monkeypatch): # Renamed fixture for clarity
+def mock_mt5_client_order_methods(openapi_client): # Renamed fixture for clarity
     mock_place_market_order = MagicMock(return_value={
         "error": False,
         "message": "Mocked BUY EURUSD 0.01 LOT at 1.1000 success (Position ID: 12345)",
@@ -22,29 +22,7 @@ def mock_mt5_client_order_methods(monkeypatch): # Renamed fixture for clarity
             order=12345
         )
     })
-    # Adjust the patching target to where 'place_market_order' is actually called.
-    # This should be the client instance used by your router.
-    # Assuming client is accessed as `request.app.state.client` in the route,
-    # and `place_market_order` is `request.app.state.client.order.place_market_order`
-    # A common way to mock this is to patch the method in the module where it's defined or used.
-    # If 'client' in 'metatrader_openapi.routers.orders' is an instance of MT5Client,
-    # and 'order' is an attribute holding an Order instance (which has place_market_order),
-    # then the target for patching is 'metatrader_openapi.routers.orders.client.order.place_market_order'.
-    # This needs to align with how 'client' is instantiated and used in 'orders.py'.
-
-    # Let's assume the client is set up in main.py and passed around, or routers.orders directly imports and uses a client instance.
-    # The provided thought process suggests: `monkeypatch.setattr("metatrader_openapi.routers.orders.client.order.place_market_order", mock_place_market_order)`
-    # This implies that in 'metatrader_openapi/routers/orders.py', there's an accessible 'client' object.
-
-    # If client is globally available in routers.orders (e.g. from a module-level import or app state)
-    # For this example, we'll assume 'client' is an object within 'routers.orders' that has an 'order' attribute.
-    # This is a common pattern if 'client' is initialized in 'main.py' and routers access 'app.state.client'.
-    # The FastAPI TestClient handles app state correctly, so patching the method on the actual client object
-    # used by the app is the most robust approach.
-    # However, the prompt specifically suggests monkeypatch.setattr on the module path.
-
-    # The prompt's suggested patch:
-    monkeypatch.setattr("metatrader_openapi.routers.orders.client.order.place_market_order", mock_place_market_order)
+    openapi_client.order.place_market_order = mock_place_market_order
     return mock_place_market_order # Return the mock that will be asserted
 
 def test_place_market_order_api_with_sl_tp(mock_mt5_client_order_methods): # Inject the patched mock
@@ -57,9 +35,9 @@ def test_place_market_order_api_with_sl_tp(mock_mt5_client_order_methods): # Inj
             "take_profit": 1.1010
             # "comment": "custom_comment_test" # Not yet part of the task, but good for future
         }
-        # Ensure endpoint is correct, e.g. /api/v1/orders/market
+        # Ensure endpoint is correct, e.g. /api/v1/order/market
         # Based on typical FastAPI structure and if orders_router is prefixed with /api/v1/orders
-        response = api_client.post("/api/v1/orders/market", json=order_payload)
+        response = api_client.post("/api/v1/order/market", json=order_payload)
 
     assert response.status_code == 200, response.text
     response_json = response.json()
@@ -99,7 +77,7 @@ def test_place_market_order_api_no_sl_tp(mock_mt5_client_order_methods): # Test 
             "type": "BUY"
             # No stop_loss or take_profit here, relying on defaults in the endpoint
         }
-        response = api_client.post("/api/v1/orders/market", json=order_payload)
+        response = api_client.post("/api/v1/order/market", json=order_payload)
 
     assert response.status_code == 200, response.text
     response_json = response.json()
@@ -133,7 +111,7 @@ def test_place_market_order_api_invalid_type(mock_mt5_client_order_methods):
             "stop_loss": 1.0990,
             "take_profit": 1.1010
         }
-        response = api_client.post("/api/v1/orders/market", json=order_payload)
+        response = api_client.post("/api/v1/order/market", json=order_payload)
 
     # Depending on where validation happens (FastAPI or client method), status code might differ
     # If FastAPI handles it via Enum in Pydantic model, it would be 422
@@ -158,23 +136,23 @@ def test_place_market_order_api_invalid_type(mock_mt5_client_order_methods):
     )
 
 # Add more tests: e.g., missing required fields (FastAPI should catch this with 422)
-def test_place_market_order_api_missing_fields(): # No mock needed if FastAPI validation catches it
+def test_place_market_order_api_missing_fields(openapi_client): # No mock needed if FastAPI validation catches it
     with TestClient(app) as api_client:
         order_payload = {
             "symbol": "EURUSD",
             # volume and type are missing
         }
-        response = api_client.post("/api/v1/orders/market", json=order_payload)
+        response = api_client.post("/api/v1/order/market", json=order_payload)
     assert response.status_code == 422 # FastAPI's Unprocessable Entity for validation errors
     # Optionally, check the content of response.json()["detail"] for specifics
     response_json = response.json()
-    assert any(field['msg'] == 'field required' and field['loc'] == ['body', 'volume'] for field in response_json['detail'])
-    assert any(field['msg'] == 'field required' and field['loc'] == ['body', 'type'] for field in response_json['detail'])
+    assert any(field['msg'].lower() == 'field required' and field['loc'] == ['body', 'volume'] for field in response_json['detail'])
+    assert any(field['msg'].lower() == 'field required' and field['loc'] == ['body', 'type'] for field in response_json['detail'])
 
 # Reminder: Ensure that the FastAPI app (`app`) and the router prefix are correctly configured
-# for the endpoint `/api/v1/orders/market`.
+# for the endpoint `/api/v1/order/market`.
 # If `main.py` includes `orders.router` with `prefix="/api/v1/orders"`,
-# and `orders.router` has a POST route at `/market`, then `/api/v1/orders/market` is correct.
+# and `orders.router` has a POST route at `/market`, then `/api/v1/order/market` is correct.
 
 # To confirm router prefix, I might need to read 'src/metatrader_openapi/main.py'
 # For now, proceeding with the assumption.

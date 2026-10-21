@@ -1,8 +1,18 @@
+import MetaTrader5 as mt5
 from typing import Union, Optional
 from ..types import TradeRequestActions
 from .send_order import send_order
+from ._result import to_client_response, STATUS_PARTIAL
 
-def place_market_order(connection, *, type: str, symbol: str, volume: Union[float, int], stop_loss: Optional[float] = 0.0, take_profit: Optional[float] = 0.0):
+def place_market_order(
+    connection,
+    *,
+    type: str,
+    symbol: str,
+    volume: Union[float, int],
+    stop_loss: Optional[float] = None,
+    take_profit: Optional[float] = None,
+):
     """
     Places a market order for a specified financial instrument.
 
@@ -14,13 +24,16 @@ def place_market_order(connection, *, type: str, symbol: str, volume: Union[floa
         type: The type of market order, either "BUY" or "SELL".
         symbol: The trading instrument symbol (e.g., "EURUSD").
         volume: The volume of the trade operation in lots.
+        stop_loss: Optional stop loss price. None or 0 means no stop loss.
+        take_profit: Optional take profit price. None or 0 means no take profit.
 
     Returns:
-        dict: A dictionary containing the result of the order operation. Includes an error flag,
-              a message detailing the success or failure, and the data from the response.
+        dict: ``error`` flag, ``message``, ``data`` (order_send result), ``status``
+              ('done', 'partial', 'rejected', 'no_response', ...), ``retcode`` and,
+              when the deal is found in the terminal history, ``position_id``.
     """
-	
-    type = type.upper()
+
+    type = str(type).upper()
 
     if type not in ["BUY", "SELL"]:
         return { "error": True, "message": f"Invalid type, should be BUY or SELL.", "data": None }
@@ -36,19 +49,20 @@ def place_market_order(connection, *, type: str, symbol: str, volume: Union[floa
     )
 
     if response["success"] is False:
-        return { "error": True, "message": response["message"], "data": None }
+        return to_client_response(response)
 
     data = response["data"]
+    filled = "Partially filled" if response["status"] == STATUS_PARTIAL else "Filled"
+    result = to_client_response(
+        response,
+        f"{filled} {type} {symbol} {data.volume} of {response['request']['volume']} LOT at {data.price} "
+        f"(order {data.order}, deal {data.deal}, {response['retcode_name']})",
+    )
 
-    if data is None:
-        return {
-            "error": False,
-            "message": "Market order success.",
-            "data": response
-        }
-
-    return {
-        "error": False,
-        "message": f"{type} {data.request.symbol} {data.volume} LOT at {data.price} success (Position ID: {data.order})",
-        "data": data
-    }
+    # Reconcile with the terminal: the deal must exist in the account history.
+    deals = mt5.history_deals_get(ticket=data.deal) if data.deal else None
+    if deals:
+        result["position_id"] = deals[0].position_id
+    else:
+        result["warning"] = "The deal was not found in the terminal history yet; verify the open positions."
+    return result

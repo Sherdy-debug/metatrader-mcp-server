@@ -5,7 +5,7 @@
 MCP server enabling AI assistants to trade on MetaTrader 5 via natural language. Provides both MCP (stdio) and HTTP/REST interfaces.
 
 **Stack**: Python 3.10+ • FastMCP • FastAPI • MetaTrader5 SDK • Pandas • Pydantic • pytest
-**Version**: 0.5.1 (Beta)
+**Version**: 0.6.0 (Beta)
 **Repo**: https://github.com/ariadng/metatrader-mcp-server
 
 ---
@@ -30,7 +30,7 @@ def place_market_order(connection, *, type: str, symbol: str, volume: Union[floa
 ```
 
 ### 2. `metatrader_mcp` - MCP Server
-- FastMCP with SSE transport (default), STDIO fallback via `--transport stdio`
+- FastMCP with STDIO transport (default); SSE/streamable HTTP via `--transport`, bound to 127.0.0.1 unless `MCP_AUTH_TOKEN` and TLS are configured (`metatrader_mcp/security.py`)
 - Tools: `@mcp.tool()` decorated functions
 - Client access: `client = get_client(ctx)`
 - Returns: CSV strings for DataFrames, dicts for objects
@@ -63,6 +63,7 @@ def operation(connection, *, param: type, optional: Optional[type] = None):
 
 ### Return Formats
 - **Client operations**: `{"error": False, "message": "...", "data": {...}}` (dict) or DataFrame
+- **Trading operations** add `status` (done|partial|placed|no_changes|rejected|no_response) and `retcode`; `send_order` interprets `retcode`, never `last_error()` alone
 - **MCP tools**: `df.to_csv()` for DataFrames, dict/list for objects
 - **REST endpoints**: `df.to_dict(orient="records")` or dict (auto JSON)
 
@@ -193,7 +194,8 @@ async def endpoint(request: Request, param: type = Body(...)):
 
 **Required**: `LOGIN`, `PASSWORD`, `SERVER`
 **Optional**: `MT5_PATH` (path to MT5 terminal executable, auto-detected if not set), `OPENAPI_TITLE`, `OPENAPI_VERSION`
-**MCP Transport**: `MCP_TRANSPORT` (sse|stdio|streamable-http, default: sse), `MCP_HOST` (default: 0.0.0.0), `MCP_PORT` (default: 8080)
+**MCP Transport**: `MCP_TRANSPORT` (stdio|sse|streamable-http, default: stdio), `MCP_HOST` (default: 127.0.0.1), `MCP_PORT` (default: 8080), `MCP_AUTH_TOKEN`, `MCP_SSL_CERTFILE`, `MCP_SSL_KEYFILE`, `MCP_ALLOW_INSECURE_REMOTE`, `MCP_ALLOWED_HOSTS`
+**Risk limits** (`metatrader_client/risk.py`): `MT5_ALLOW_LIVE_TRADING` (default false: demo only), `MT5_MAX_VOLUME_PER_ORDER`, `MT5_MAX_TOTAL_VOLUME`, `MT5_MAX_OPEN_POSITIONS`, `MT5_MAX_RISK_PER_TRADE_PCT`, `MT5_REQUIRE_STOP_LOSS`, `MT5_MAX_DAILY_LOSS`, `MT5_DUPLICATE_WINDOW_SECONDS`
 **Debug**: Set `debug: True` in config dict
 
 ---
@@ -201,10 +203,9 @@ async def endpoint(request: Request, param: type = Body(...)):
 ## Testing & Debugging
 
 ```bash
-# Run tests
-pytest tests/                           # All
-pytest tests/metatrader_client/         # Client only
-pytest tests/test_orders_route.py       # Specific
+# Run tests (unit tests use a fake MT5 in tests/unit/fakes.py and never reach a terminal)
+pytest                                                  # Unit and route tests; integration tests are skipped
+MT5_RUN_INTEGRATION=1 pytest tests/metatrader_client/   # Integration: dedicated demo account only
 
 # Debug
 client.is_connected()                   # Check connection
