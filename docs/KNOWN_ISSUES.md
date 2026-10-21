@@ -125,14 +125,11 @@ El adaptador local de Rinari instalado durante la revisión serializa las llamad
 
 ### Resolución
 
-Commits `cd2001c398f28a54804a24d6d08ebbe49c400413` y `546517caef10f4723eea7067d1d195722f1be27c` (seguimiento de la revisión del PR #2). `send_order` ejecuta la comprobación de duplicados, los límites, `order_send` y la reserva dentro de `RiskGuard.opening()`, un bloqueo por guard (uno por conexión).
+Commits `cd2001c398f28a54804a24d6d08ebbe49c400413`, `546517caef10f4723eea7067d1d195722f1be27c` y `19137d73cb40f288cc157f4c846b19092ca1f144` (seguimientos de las revisiones del PR #2). `send_order` ejecuta la comprobación de duplicados, los límites, `order_send` y la reserva dentro de `RiskGuard.opening()`, un bloqueo por guard (uno por conexión).
 
-Cada reserva tiene dos partes que se reconcilian por separado hasta que el terminal las lista o vencen `RESERVATION_TTL_SECONDS` (60 s):
+Cada reserva registra el volumen comprometido (ejecutado + activo) y se reconcilia **por volumen** hasta que el terminal lo lista o vencen `RESERVATION_TTL_SECONDS` (60 s): sigue reservado el comprometido menos lo que los listados muestran para su ticket, es decir, el volumen de las posiciones cuyo `ticket` o `identifier` coincide más el `volume_current` de la orden residual. La mera presencia del ticket no libera nada, de modo que un listado que va por detrás de otro no oculta exposición. Una reducción que las posiciones no explican (remanente llenado aún sin publicar, o cancelado) se conserva hasta el TTL: es la política explícita para estado incierto.
 
-- **Ejecutada:** se libera a medida que aparecen posiciones cuyo `ticket` o `identifier` es el ticket de la orden.
-- **Activa:** volumen que sigue trabajando como orden con ese ticket. Se libera cuando la orden aparece en `orders_get` (que ya cuenta su `volume_current`), o en la medida en que las posiciones superen la parte ejecutada porque el remanente también se llenó.
-
-Cada parte no listada ocupa un hueco de `max_open_positions`, igual que hará en el terminal. Política (`RiskGuard.after_send`):
+La posición esperada para la parte ejecutada y la orden esperada para la parte activa ocupan un hueco de `max_open_positions` cada una mientras no aparezcan, igual que harán en el terminal. Política (`RiskGuard.after_send`):
 
 - `done`: el volumen solicitado como ejecutado.
 - `partial`: el volumen llenado como ejecutado. El remanente queda como activo con RETURN o con una política desconocida; con IOC o FOK lo cancela el servidor y no se reserva.
@@ -151,12 +148,21 @@ La revisión del commit `9fc7a75` encontró que un `partial` reducía la reserva
 - [x] Orden residual visible y posición aún no visible: no se pierde el presupuesto de la parte ejecutada (`test_working_remainder_listed_without_position_keeps_executed_budget`).
 - [x] Posición y remanente visibles: se reconcilian las reservas sin contar dos veces el mismo volumen (`test_position_and_remainder_listed_are_not_counted_twice`).
 
+Segunda revisión (commit `1331b0d`): la orden residual visible liberaba todo el remanente aunque listara menos volumen. Con 0.04 ejecutados + 0.06 activos, otro llenado de 0.04 publicado primero en la orden (0.02 activos) y no en la posición (0.04) permitía otra orden de 0.09 (0.19 en total, límite 0.15). Resuelto en `19137d7` reconciliando por volumen:
+
+- [x] Posición 0.04 + remanente 0.02 publicados: una nueva orden de 0.09 se bloquea (`test_second_review_reproduction_lagging_position_listing`).
+- [x] Posición 0.08 + remanente 0.02 publicados: se reconcilia sin doble conteo y siguen contando 0.10 (`test_published_fills_are_reconciled_without_double_counting`).
+- [x] Reducción del remanente sin evidencia de ejecución (posible cancelación): se conserva hasta el TTL (`test_unexplained_remainder_reduction_stays_reserved_until_ttl`).
+
+Contra `1331b0d` falla la reproducción; las otras dos pruebas comprueban comportamiento que ya era correcto.
+
 Casos adicionales cubiertos: posición visible con el remanente aún no listado, remanente llenado después dentro de la posición, política de llenado desconocida (se conserva el remanente) y los dos huecos que ocupa un RETURN parcial. Contra el código de `9fc7a75` fallan 5 de estas 8 pruebas; las otras 3 comprueban comportamiento que ya era correcto.
 
 ## Validación realizada y trabajo restante
 
 - La suite sin integración de 0.6.0 pasó: **112 pruebas aprobadas, 39 de integración excluidas**, con una advertencia de deprecación de Starlette/httpx.
 - Los tres hallazgos se reprodujeron con `FakeMT5` y respuestas en memoria; no se enviaron operaciones.
+- Tras `19137d7`: 146 pruebas aprobadas y 39 de integración excluidas.
 - Tras `546517c`: 143 pruebas aprobadas y 39 de integración excluidas.
 - Tras `cd2001c`: 135 pruebas aprobadas y 39 de integración excluidas. Las 23 pruebas de regresión se ejecutaron también contra el código anterior: 19 fallan allí (las 4 restantes comprueban comportamiento que no debía cambiar).
 - En el despliegue local se verificaron conexión demo, esquema SL/TP, consultas de lectura de XAUUSDm y permisos de trading. `ready_to_trade: true` describe permisos, no una certificación de ejecución o de los controles de riesgo.

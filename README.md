@@ -613,7 +613,7 @@ Closing a position also returns `verification`: `confirmed` only when a valid qu
 
 Bulk operations (`close_all_*`, `cancel_all_*`) return the result of every item, the tickets whose final state is unknown (`unverified`) and the tickets still present afterwards.
 
-If a configured limit needs terminal data that cannot be read, new orders are blocked. Risk checks and the order request run atomically per connection, and sent orders stay reserved (including the working remainder of a RETURN partial fill) until the terminal lists them; this does not coordinate several processes or connections on the same account.
+If a configured limit needs terminal data that cannot be read, new orders are blocked. Risk checks and the order request run atomically per connection, and sent orders stay reserved (including the working remainder of a RETURN partial fill) until the listings show their full volume; this does not coordinate several processes or connections on the same account.
 
 ### Custom Port and Host (HTTP API)
 
