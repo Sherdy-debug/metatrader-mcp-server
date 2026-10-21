@@ -410,3 +410,47 @@ def test_return_partial_reserves_a_slot_for_position_and_order(fake_mt5, connect
     result = try_buy(connection, 0.1)
     assert result["error"] is True
     assert "2 recently sent and not listed yet" in result["message"]
+
+
+# ---------------------------------------------------------------------------
+# MT5-003 second follow-up: the residual order releases only the volume it lists
+# ---------------------------------------------------------------------------
+
+def test_second_review_reproduction_lagging_position_listing(fake_mt5, connection):
+    ticket, _ = partial_fill(fake_mt5, connection, exemode=3, filling_mask=0)
+    # Another 0.04 of the remainder filled: the order already lists 0.02 working,
+    # but the position still shows the first 0.04.
+    fake_mt5.positions = [make_position(ticket, volume=0.04)]
+    fake_mt5.orders = [make_order(ticket, type=0, volume=0.02)]
+
+    # Listed 0.06 + 0.04 not published yet = 0.10 committed; 0.10 + 0.09 = 0.19 > 0.15.
+    second = try_buy(connection, 0.09)
+    assert second["error"] is True
+    assert "Total exposure would be 0.19 lots" in second["message"]
+    assert try_buy(connection, 0.05)["error"] is False
+
+
+def test_published_fills_are_reconciled_without_double_counting(fake_mt5, connection):
+    ticket, _ = partial_fill(fake_mt5, connection, exemode=3, filling_mask=0)
+    fake_mt5.positions = [make_position(ticket, volume=0.08)]
+    fake_mt5.orders = [make_order(ticket, type=0, volume=0.02)]
+
+    # Everything is listed: 0.08 + 0.02 = 0.10, still counted once.
+    blocked = try_buy(connection, 0.06)
+    assert blocked["error"] is True
+    assert "Total exposure would be 0.16 lots" in blocked["message"]
+    assert connection.risk_guard._reservations == []
+    assert try_buy(connection, 0.05)["error"] is False
+
+
+def test_unexplained_remainder_reduction_stays_reserved_until_ttl(fake_mt5, connection, monkeypatch):
+    ticket, _ = partial_fill(fake_mt5, connection, exemode=3, filling_mask=0)
+    # The residual order disappeared and the position did not grow: filled but not
+    # published yet, or cancelled. Without evidence the 0.06 stays reserved.
+    fake_mt5.positions = [make_position(ticket, volume=0.04)]
+    fake_mt5.orders = []
+
+    assert try_buy(connection, 0.11)["error"] is True  # 0.04 + 0.06 + 0.11 > 0.15
+
+    monkeypatch.setattr(risk, "RESERVATION_TTL_SECONDS", 0)
+    assert try_buy(connection, 0.11)["error"] is False  # expired: only the listed 0.04 counts

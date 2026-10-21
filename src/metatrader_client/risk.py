@@ -30,11 +30,14 @@ blocked instead of assuming that there is none.
 Concurrency: the checks, the request and the reservation of an opening order
 run under one lock per :class:`RiskGuard` (one per connection). An order that
 was sent is reserved until the terminal lists it or ``RESERVATION_TTL_SECONDS``
-pass, in two parts reconciled independently: the executed volume (released as
-positions with the order ticket appear) and the volume still working as an
-order (released when the order is listed with its current volume). A partial
-fill with RETURN filling keeps its remainder reserved; with IOC or FOK the
-remainder is cancelled by the server and is not reserved. A rejected order
+pass. The reservation is reconciled by volume: the committed volume (executed
+plus still working) minus what the listings show for its ticket (position
+volume plus the current volume of the residual order) stays reserved, so a
+listing that lags behind another never releases unpublished exposure. A
+reduction that the positions do not explain (for example a cancelled
+remainder) stays reserved until the TTL. A partial fill with RETURN filling
+keeps its remainder committed; with IOC or FOK the remainder is cancelled by
+the server and is not reserved. A rejected order
 reserves nothing; an order with an unknown outcome stays reserved for the full
 TTL. The protection covers threads sharing a connection in one process. It does
 not coordinate other processes, other connections, manual trading or other
@@ -132,23 +135,29 @@ class _Reservation:
     working: float
     created: float
 
-    def unlisted(self, positions, orders) -> Tuple[float, float]:
-        """Return the (executed, working) volume that the listings do not show yet."""
+    def unlisted(self, positions, orders) -> Tuple[float, int]:
+        """
+        Return the volume and the number of entries that the listings do not show yet.
+
+        The committed volume (executed + working) is compared with what the
+        listings show for this ticket: the volume of positions whose ticket or
+        identifier matches, plus the current volume of the residual order. The
+        presence of the ticket alone does not release anything.
+        """
         if self.ticket is None:
-            return self.executed, self.working
+            return self.executed + self.working, int(self.executed > _EPS) + int(self.working > _EPS)
         in_positions = sum(
             float(p.volume) for p in positions
             if self.ticket in (getattr(p, "ticket", None), getattr(p, "identifier", None))
         )
-        order_listed = any(getattr(o, "ticket", None) == self.ticket for o in orders)
-        executed = max(0.0, self.executed - in_positions)
-        if order_listed:
-            # The listing already counts the order with its current volume.
-            working = 0.0
-        else:
-            # Volume filled beyond the executed part (the remainder filling later) leaves the working part.
-            working = max(0.0, self.executed + self.working - in_positions) - executed
-        return executed, working
+        in_orders = [float(getattr(o, "volume_current", 0) or 0) for o in orders if getattr(o, "ticket", None) == self.ticket]
+        committed = self.executed + self.working
+        volume = max(0.0, committed - in_positions - sum(in_orders))
+        # Entries the terminal will list once it catches up: a position for the
+        # executed part and an order for the part still working.
+        slots = int(self.executed > _EPS and in_positions <= _EPS)
+        slots += int(self.working > _EPS and not in_orders and in_positions < committed - _EPS)
+        return volume, slots
 
 
 def _read(mt5, function: str, **kwargs) -> Tuple[Optional[tuple], Optional[str]]:
@@ -235,7 +244,7 @@ class RiskGuard:
             if error:
                 return f"Cannot verify exposure limits, new orders are blocked: {error}"
             reserved = self._unlisted_reservations(positions, orders)
-            reserved_slots = sum((executed > _EPS) + (working > _EPS) for executed, working in reserved)
+            reserved_slots = sum(slots for _, slots in reserved)
             open_count = len(positions) + len(orders) + reserved_slots
             if cfg.max_open_positions is not None and open_count + 1 > cfg.max_open_positions:
                 return (
@@ -247,7 +256,7 @@ class RiskGuard:
                 current = (
                     sum(float(p.volume) for p in positions)
                     + sum(float(o.volume_current) for o in orders)
-                    + sum(executed + working for executed, working in reserved)
+                    + sum(volume for volume, _ in reserved)
                 )
                 if current + volume > cfg.max_total_volume + 1e-9:
                     return (
@@ -411,26 +420,25 @@ class RiskGuard:
                 _Reservation(ticket=ticket, executed=executed, working=working, created=time.monotonic())
             )
 
-    def _unlisted_reservations(self, positions, orders) -> List[Tuple[float, float]]:
+    def _unlisted_reservations(self, positions, orders) -> List[Tuple[float, int]]:
         """
         Reconcile reservations with the listings.
 
-        Returns the (executed, working) volume of each reservation that the
-        listings do not show yet, and drops reservations that expired or are
-        fully listed.
+        Returns the unlisted (volume, entries) of each reservation, and drops
+        reservations that expired or are fully listed.
         """
         now = time.monotonic()
-        unlisted: List[Tuple[float, float]] = []
+        unlisted: List[Tuple[float, int]] = []
         with self._lock:
             kept = []
             for reservation in self._reservations:
                 if now - reservation.created >= RESERVATION_TTL_SECONDS:
                     continue
-                executed, working = reservation.unlisted(positions, orders)
-                if executed + working <= _EPS:
+                volume, slots = reservation.unlisted(positions, orders)
+                if volume <= _EPS and slots == 0:
                     continue
                 kept.append(reservation)
-                unlisted.append((executed, working))
+                unlisted.append((volume, slots))
             self._reservations = kept
         return unlisted
 
