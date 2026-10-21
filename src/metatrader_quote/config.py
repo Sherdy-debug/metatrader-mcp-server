@@ -16,7 +16,7 @@ class Settings(BaseSettings):
         poll_interval_ms (int): Polling interval in milliseconds.
     """
 
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8765
     symbols: str = "XAUUSD,USOIL,GBPUSD,USDJPY,EURUSD,BTCUSD"
     poll_interval_ms: int = 100

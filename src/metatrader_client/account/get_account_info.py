@@ -9,7 +9,7 @@ def get_account_info(connection) -> Dict[str, Any]:
     Get comprehensive account information.
     Returns a dictionary with all account properties including:
     - login: Account number
-    - trade_mode: Account trade mode (0-real, 1-demo, 2-contest)
+    - trade_mode: Account trade mode (0-demo, 1-contest, 2-real)
     - leverage: Account leverage
     - balance: Account balance in deposit currency
     - credit: Credit in deposit currency

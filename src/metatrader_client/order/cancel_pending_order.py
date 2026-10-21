@@ -1,6 +1,7 @@
 from typing import Union
 from ..types import TradeRequestActions
 from .send_order import send_order
+from ._result import to_client_response
 
 def cancel_pending_order(connection, id: Union[int, str]):
     """
@@ -16,7 +17,7 @@ def cancel_pending_order(connection, id: Union[int, str]):
     """
     try:
         order_id = int(id)
-    except ValueError:
+    except (TypeError, ValueError):
         return {
             "error": True,
             "message": f"Invalid order ID {id}",
@@ -27,11 +28,4 @@ def cancel_pending_order(connection, id: Union[int, str]):
         action=TradeRequestActions.REMOVE,
         order=order_id,
     )
-    if response["success"] is False:
-        return { "error": True, "message": response["message"], "data": None }
-    data = response["data"]
-    return {
-        "error": False,
-        "message": f"Cancel pending order {order_id} success",
-        "data": data,
-    }
+    return to_client_response(response, f"Canceled pending order {order_id} ({response['retcode_name']})")

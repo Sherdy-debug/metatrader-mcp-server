@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "metatrader-mcp-server"
-version = "0.5.1"
+version = "0.6.0"
 authors = [
   { name = "Aria Dhanang", email = "ariadng@gmail.com" },
 ]
@@ -25,23 +25,22 @@ classifiers = [
     "Topic :: Office/Business :: Financial :: Investment",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+# Upper bounds exclude untested major versions (mcp 2.x removed FastMCP).
+# Exact tested versions are recorded in uv.lock.
 dependencies = [
-  "python-dotenv>=1.1.0",
-  "MetaTrader5>=5.0.45",
-  "numpy>=2.2.4",
-  "pandas>=2.2.3",
-  "tabulate>=0.9.0",
-  "pytest>=8.3.5",
-  "httpx>=0.24.0",
-  "build>=1.2.2.post1",
-  "fastapi>=0.115.12",
-  "uvicorn[standard]>=0.34.1",
-  "pydantic>=2.11.3",
-  "pydantic-settings>=2.8.1",
-  "mcp[cli]>=1.6.0",
-  "click>=8.0.0",
+  "python-dotenv>=1.1.0,<2",
+  "MetaTrader5>=5.0.45,<6",
+  "numpy>=2.2.4,<3",
+  "pandas>=2.2.3,<3",
+  "tabulate>=0.9.0,<1",
+  "fastapi>=0.115.12,<1",
+  "uvicorn[standard]>=0.34.1,<1",
+  "pydantic>=2.11.3,<3",
+  "pydantic-settings>=2.8.1,<3",
+  "mcp[cli]>=1.25.0,<2",
+  "click>=8.0.0,<9",
   "pytz",
-  "websockets>=13.0",
+  "websockets>=13.0,<18",
 ]
 
 [tool.setuptools.packages.find]
@@ -54,8 +53,19 @@ include = ["metatrader_mcp*", "metatrader_client*", "metatrader_openapi*", "meta
 
 [project.optional-dependencies]
 client = []
+dev = [
+  "pytest>=8.3.5,<10",
+  "httpx>=0.24.0,<1",
+  "anyio>=4,<5",
+  "build>=1.2.2.post1",
+]
 
 [project.scripts]
 "metatrader-mcp-server" = "metatrader_mcp.cli:main"
 "metatrader-http-server" = "metatrader_openapi.main:main"
 "metatrader-quote-server" = "metatrader_quote.cli:main"
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "integration: needs a running MetaTrader 5 terminal logged in to a dedicated demo account (set MT5_RUN_INTEGRATION=1)",
+]

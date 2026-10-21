@@ -49,22 +49,22 @@ This is **financial software**. Every trade action involves real money. Be preci
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `place_market_order` | `symbol: str`, `volume: float`, `type: str` (BUY/SELL) | dict: error, message, data (TradeResult) |
-| `place_pending_order` | `symbol: str`, `volume: float`, `type: str`, `price: float`, `stop_loss: float = 0.0`, `take_profit: float = 0.0` | dict: error, message, data |
+| `place_market_order` | `symbol: str`, `volume: float`, `type: str` (BUY/SELL), `stop_loss: float = None`, `take_profit: float = None` | dict: error, message, status, retcode, data (TradeResult), position_id |
+| `place_pending_order` | `symbol: str`, `volume: float`, `type: str`, `price: float`, `stop_loss: float = None`, `take_profit: float = None` | dict: error, message, status, retcode, data |
 
 ### Modification
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `modify_position` | `id: int/str`, `stop_loss: float`, `take_profit: float` | dict: error, message, data |
-| `modify_pending_order` | `id: int/str`, `price: float`, `stop_loss: float`, `take_profit: float` | dict: error, message, data |
+| `modify_position` | `id: int/str`, `stop_loss: float`, `take_profit: float` (omitted = keep, 0 = remove) | dict: error, message, status, retcode, data |
+| `modify_pending_order` | `id: int/str`, `price: float`, `stop_loss: float`, `take_profit: float` (omitted = keep, 0 = remove) | dict: error, message, status, retcode, data |
 
 ### Position Closure
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
 | `close_position` | `id: int/str` | dict: error, message, data |
-| `close_all_positions` | (none) | dict |
+| `close_all_positions` | (none) | dict: error, message, data (results per position, failed, remaining) |
 | `close_all_positions_by_symbol` | `symbol: str` | dict |
 | `close_all_profitable_positions` | (none) | dict |
 | `close_all_losing_positions` | (none) | dict |
@@ -99,11 +99,12 @@ Present as a unified dashboard.
 
 ### Market Order with SL/TP
 
-The `place_market_order` tool does NOT accept SL/TP parameters. Use this two-step workflow:
+Pass `stop_loss` and `take_profit` directly to `place_market_order`, so the position is never open without protection.
 
-1. Call `place_market_order` with symbol, volume, type
-2. Extract the position ID from the trade result (`data.order` or `data.deal`)
-3. Call `modify_position` with the position ID to set SL/TP
+Check the result before reporting success:
+- Only `error: false` means the order was executed. `status` is `done`, `partial`, `rejected` or `no_response`.
+- On `partial`, report the filled volume. On `no_response`, list positions before retrying: the order may have been executed.
+- A rejection by the server's risk limits (live account, volume, exposure, risk per trade, daily loss, duplicate request) is final: report it, do not try to work around it.
 
 ### Pending Order
 

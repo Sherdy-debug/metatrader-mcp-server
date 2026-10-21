@@ -2,23 +2,67 @@
 
 Fork de trabajo: https://github.com/Xainner/metatrader-mcp-server
 
-Este fork se mantiene para corregir los problemas detectados en la revisión antes de habilitar operaciones automáticas. Esta entrega añade documentación; los arreglos del código quedan pendientes para una próxima sesión.
+Este fork se mantiene para corregir los problemas detectados en la revisión antes de habilitar operaciones automáticas. La segunda entrega (versión 0.6.0) implementa los arreglos; la validación en una cuenta demo sigue pendiente.
 
 ## Arreglos pendientes
 
-- [ ] Interpretar `retcode`, manejar resultados nulos y distinguir aceptación, ejecución parcial, ejecución completa y rechazo.
-- [ ] Preservar SL/TP al modificar únicamente el precio de una orden pendiente.
-- [ ] Exponer SL/TP en las órdenes de mercado del cliente y MCP; obtener el precio antes de validar sus niveles.
-- [ ] Usar un transporte local por defecto y proteger cualquier acceso remoto con autenticación.
-- [ ] Comprobar y comunicar cada cierre individual en las operaciones masivas.
-- [ ] Corregir la selección del modo de llenado según símbolo, tipo de ejecución y clase de orden.
-- [ ] Validar volumen mínimo, máximo y paso, precisión del precio y distancia mínima de los stops según el símbolo.
-- [ ] Incorporar límites configurables de riesgo, exposición y pérdida diaria, y prevención de solicitudes duplicadas.
-- [ ] Aislar las pruebas automáticas con simulaciones; exigir cuenta demo explícita para pruebas de integración que operen.
-- [ ] Verificar arranque, esquemas MCP y compatibilidad de dependencias; fijar versiones probadas.
+- [x] Interpretar `retcode`, manejar resultados nulos y distinguir aceptación, ejecución parcial, ejecución completa y rechazo.
+- [x] Preservar SL/TP al modificar únicamente el precio de una orden pendiente.
+- [x] Exponer SL/TP en las órdenes de mercado del cliente y MCP; obtener el precio antes de validar sus niveles.
+- [x] Usar un transporte local por defecto y proteger cualquier acceso remoto con autenticación.
+- [x] Comprobar y comunicar cada cierre individual en las operaciones masivas.
+- [x] Corregir la selección del modo de llenado según símbolo, tipo de ejecución y clase de orden.
+- [x] Validar volumen mínimo, máximo y paso, precisión del precio y distancia mínima de los stops según el símbolo.
+- [x] Incorporar límites configurables de riesgo, exposición y pérdida diaria, y prevención de solicitudes duplicadas.
+- [x] Aislar las pruebas automáticas con simulaciones; exigir cuenta demo explícita para pruebas de integración que operen.
+- [x] Verificar arranque, esquemas MCP y compatibilidad de dependencias; fijar versiones probadas.
 - [ ] Validar los cambios en una cuenta demo dedicada antes de considerar uso real.
 
-Las casillas solo deben marcarse tras implementar y verificar cada cambio. El alcance de esta revisión y las limitaciones de sus pruebas se describen a continuación.
+Las casillas solo deben marcarse tras implementar y verificar cada cambio. Las casillas marcadas se verificaron con pruebas automáticas contra un terminal simulado y con el arranque real del servidor sin credenciales; ninguna se verificó contra un servidor de trading real (ver "Implementación"). El alcance de la revisión inicial y las limitaciones de sus pruebas se describen a continuación.
+
+---
+
+## Implementación (versión 0.6.0)
+
+Fecha: 20 de octubre de 2026.
+
+| Ítem | Cambio | Verificación |
+|---|---|---|
+| Resultados | `order/_result.py` clasifica cada respuesta en `done`, `partial`, `placed`, `no_changes`, `rejected` o `no_response` y conserva `retcode`. Un `DONE` con volumen menor al pedido se trata como parcial. Se corrigieron los valores de `TradeReturnCodes`, que no coincidían con MetaTrader 5 (p. ej. `TIMEOUT` duplicaba 10010). | `tests/unit/test_orders.py`: rechazo 10019, `None`, parcial, colocada; enum contrastado con las constantes `TRADE_RETCODE_*` del paquete. |
+| Reconciliación | La orden de mercado busca el deal en el historial y devuelve `position_id`; el cierre consulta la posición después y reporta el volumen restante. | `test_done_market_order_is_filled_and_reconciled`, `test_close_position_reports_remaining_volume`. |
+| Modificar pendiente | Se leen la orden actual y se reenvían SL, TP, `type_time`, expiración y `stoplimit` no indicados. `0` elimina un nivel de forma explícita. | `test_modify_pending_price_keeps_sl_tp_and_expiration`, `test_modify_pending_zero_removes_level_explicitly`. |
+| SL/TP en mercado | Parámetros en `MT5Order`, la herramienta MCP y la skill; la cotización se lee antes de validar y los stops se miden contra el precio de cierre (bid/ask). | Caso de la revisión (SL 1.09, ask 1.1001) envía la orden con SL y TP. |
+| Transporte | STDIO por defecto; HTTP en `127.0.0.1`. Cualquier otra dirección exige `MCP_AUTH_TOKEN` (≥ 32 caracteres, Bearer) y TLS, salvo proxy declarado. La API REST aplica lo mismo (`OPENAPI_AUTH_TOKEN`), elimina el CORS `*` y `reload=True`. El servidor de cotizaciones escucha en `127.0.0.1`. | `tests/unit/test_transport.py`; servidor SSE real: 401 sin token o con token inválido, stream con token válido; arranque en `0.0.0.0` rechazado sin token y sin TLS. |
+| Masivas | `order/_bulk.py` procesa cada ticket, informa su resultado y vuelve a consultar el terminal; `error` es verdadero si alguno falla o sigue presente. | `tests/unit/test_bulk.py`: dos cierres fallidos ya no devuelven éxito. |
+| Llenado | Pendientes: RETURN. Request/Instant: FOK. Market: FOK o IOC según la máscara, error explícito si no hay ninguno. Exchange: FOK, IOC o RETURN. BOC nunca se usa en mercado. | Máscara 0 en Market devuelve error controlado en vez de `UnboundLocalError`; matriz de casos parametrizada. |
+| Validación por símbolo | `order/_validation.py`: volumen mínimo, máximo y paso; precio según dígitos y tamaño de tick (se rechaza indicando el valor válido más cercano en vez de redondear); distancia `trade_stops_level` para SL, TP y precio de pendientes. | Pruebas parametrizadas en `test_orders.py`. |
+| Riesgo | `metatrader_client/risk.py`: solo cuentas demo salvo `MT5_ALLOW_LIVE_TRADING=true`; límites opcionales de lotes por orden, exposición total, número de posiciones, % de riesgo en el SL, SL obligatorio y pérdida diaria (día del servidor, realizado + flotante); rechazo de solicitudes idénticas en 10 s, incluida la repetición tras un resultado desconocido. Los cierres no se bloquean por límites de exposición. | `tests/unit/test_risk.py`. |
+| Pruebas | `tests/conftest.py` elimina credenciales y bloquea `initialize`, `login`, `order_send` y `order_check` en las pruebas unitarias. Las de `tests/metatrader_client` se marcan `integration`, solo corren con `MT5_RUN_INTEGRATION=1` y terminan la sesión si la cuenta conectada no es demo. Se corrigieron las pruebas de rutas REST, que estaban desactualizadas y fallaban. | `pytest`: 112 pruebas pasan, 39 de integración omitidas. |
+| Dependencias | Rangos con límite superior de versión mayor (`mcp<2`, `pandas<3`, ...); `mcp>=1.25` es el mínimo comprobado; `uv.lock` regenerado; pytest y build pasan al extra `dev`. Se añadió el decorador que faltaba en `get_candles_by_date` y se corrigieron anotaciones de retorno de herramientas que devuelven CSV. | Arranque real por STDIO sin credenciales: `initialize` y `tools/list` responden con 26 herramientas. Suite en verde con `uv.lock` (mcp 1.30.0, pandas 2.2.3), con las últimas versiones compatibles (fastapi 0.156, pydantic 2.14) y con mcp 1.25. |
+
+### Hallazgos adicionales corregidos
+
+- `get_account_type` invertía demo y real: MetaTrader 5 define `ACCOUNT_TRADE_MODE_DEMO = 0`, `CONTEST = 1`, `REAL = 2`. Una cuenta real se informaba como demo.
+- Con las dependencias sin límite superior, `pip install` resolvía `mcp 2.x` y el servidor no arrancaba (`ModuleNotFoundError: mcp.server.fastmcp`).
+- La API REST permitía CORS desde cualquier origen sin autenticación: una página web abierta en el mismo equipo podía enviar órdenes a `127.0.0.1:8000`.
+- El ciclo de vida del servidor MCP fallaba al cerrar sin credenciales (`None.disconnect()`).
+- La skill de trading indicaba abrir sin SL y añadirlo después.
+
+### Cambios de comportamiento
+
+- El transporte por defecto pasa de SSE en `0.0.0.0` a STDIO. Quien use SSE debe indicarlo y configurar token y TLS para acceso remoto.
+- Las operaciones se rechazan en cuentas no demo hasta habilitar `MT5_ALLOW_LIVE_TRADING`.
+- Los resultados incluyen `status` y `retcode`; `data` sigue siendo el `TradeResult` en el cliente Python y un diccionario en MCP.
+- Precios con más decimales que el símbolo se rechazan en lugar de enviarse.
+
+### Pendiente: validación en cuenta demo
+
+No se conectó ningún terminal ni se enviaron órdenes. Antes de considerar uso real:
+
+1. Configurar `.env` con una cuenta demo dedicada y ejecutar `MT5_RUN_INTEGRATION=1 pytest tests/metatrader_client`.
+2. Probar manualmente apertura con SL/TP, modificación de pendiente solo en precio, rechazo (volumen inválido o mercado cerrado), llenado parcial si el bróker lo permite, cierre individual y masivo.
+3. Comprobar en la demo que el límite de pérdida diaria coincide con el día del servidor del bróker.
+4. Revisar los límites de riesgo que se usarán y documentarlos junto al despliegue.
 
 ---
 

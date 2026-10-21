@@ -16,6 +16,7 @@ except ImportError:
     raise ImportError("MetaTrader5 package is not installed. Please install it with: pip install MetaTrader5")
 
 from metatrader_client.exceptions import ConnectionError, InitializationError, LoginError, DisconnectionError
+from .risk import RiskConfig, RiskGuard
 from .connection import (
     _find_terminal_path,
     _ensure_cooldown,
@@ -56,6 +57,7 @@ class MT5Connection:
                 - max_retries (int): Maximum number of connection retries (default: 3).
                 - backoff_factor (float): Backoff factor for retry delays (default: 1.5).
                 - cooldown_time (float): Cooldown time between connections in seconds (default: 2.0).
+                - risk (dict): Risk limits, see ``metatrader_client.risk`` (default: environment variables).
         """
         self.config = config
         self.path = config.get("path")
@@ -68,6 +70,7 @@ class MT5Connection:
         self.max_retries = config.get("max_retries", 3)
         self.backoff_factor = config.get("backoff_factor", 1.5)
         self.cooldown_time = config.get("cooldown_time", 2.0)
+        self.risk_guard = RiskGuard(RiskConfig.from_sources(config.get("risk")))
         self._connected = False
         self._last_connection_time = 0
         

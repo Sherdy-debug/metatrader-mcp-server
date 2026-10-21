@@ -1,6 +1,7 @@
 from typing import Optional, Union
 from ..types import TradeRequestActions
 from .send_order import send_order
+from ._result import to_client_response
 from ..client_market import MT5Market
 
 def place_pending_order(
@@ -10,8 +11,8 @@ def place_pending_order(
 	symbol: str,
 	volume: Union[float, int],
 	price: Union[float, int],
-	stop_loss: Optional[Union[float, int]] = 0.0,
-	take_profit: Optional[Union[float, int]] = 0.0,
+	stop_loss: Optional[Union[float, int]] = None,
+	take_profit: Optional[Union[float, int]] = None,
 ):
 	"""
 	Places a pending order on the MetaTrader 5 platform.
@@ -36,6 +37,7 @@ def place_pending_order(
 		it contains an order ID. Otherwise, it contains an error message.
 	"""
 	
+	type = str(type).upper()
 	accepted_types  = ["BUY", "SELL"]
 	if type not in accepted_types:
 		return { "error": True, "message": f"Invalid type, should be BUY or SELL.", "data": None }
@@ -57,17 +59,16 @@ def place_pending_order(
 		action = TradeRequestActions.PENDING,
 		order_type = order_type,
 		symbol = symbol,
-		volume = float(volume),
-		price = float(price),
-		stop_loss = float(stop_loss),
-		take_profit = float(take_profit),
+		volume = volume,
+		price = price,
+		stop_loss = stop_loss,
+		take_profit = take_profit,
 	)
 
 	if response["success"] is False:
-		return { "error": True, "message": response["message"], "data": None }
+		return to_client_response(response)
 
-	return {
-		"error": False,
-		"message": f"Place pending order {order_type} {symbol} {volume} LOT at {price} success (Order ID: {response['data'].order})",
-		"data": response["data"],
-	}
+	return to_client_response(
+		response,
+		f"Placed pending order {order_type} {symbol} {volume} LOT at {price} (Order ID: {response['data'].order}, {response['retcode_name']})",
+	)
