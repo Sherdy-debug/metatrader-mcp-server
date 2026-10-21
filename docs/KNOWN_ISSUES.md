@@ -125,19 +125,39 @@ El adaptador local de Rinari instalado durante la revisión serializa las llamad
 
 ### Resolución
 
-Commit `cd2001c398f28a54804a24d6d08ebbe49c400413`. `send_order` ejecuta la comprobación de duplicados, los límites, `order_send` y la reserva dentro de `RiskGuard.opening()`, un bloqueo por guard (uno por conexión). Política de reservas (`RiskGuard.after_send`):
+Commits `cd2001c398f28a54804a24d6d08ebbe49c400413` y `546517caef10f4723eea7067d1d195722f1be27c` (seguimiento de la revisión del PR #2). `send_order` ejecuta la comprobación de duplicados, los límites, `order_send` y la reserva dentro de `RiskGuard.opening()`, un bloqueo por guard (uno por conexión).
 
-- `done`, `placed`: se reserva un hueco y el volumen hasta que el terminal liste el ticket (`ticket` o `identifier` de la posición, `ticket` de la orden) o venzan `RESERVATION_TTL_SECONDS` (60 s).
-- `partial`: se reserva el volumen ejecutado.
-- `no_response`: se reserva el volumen solicitado durante todo el TTL y la clave queda registrada como duplicado.
+Cada reserva tiene dos partes que se reconcilian por separado hasta que el terminal las lista o vencen `RESERVATION_TTL_SECONDS` (60 s):
+
+- **Ejecutada:** se libera a medida que aparecen posiciones cuyo `ticket` o `identifier` es el ticket de la orden.
+- **Activa:** volumen que sigue trabajando como orden con ese ticket. Se libera cuando la orden aparece en `orders_get` (que ya cuenta su `volume_current`), o en la medida en que las posiciones superen la parte ejecutada porque el remanente también se llenó.
+
+Cada parte no listada ocupa un hueco de `max_open_positions`, igual que hará en el terminal. Política (`RiskGuard.after_send`):
+
+- `done`: el volumen solicitado como ejecutado.
+- `partial`: el volumen llenado como ejecutado. El remanente queda como activo con RETURN o con una política desconocida; con IOC o FOK lo cancela el servidor y no se reserva.
+- `placed`: el volumen solicitado como activo (pendientes y órdenes de mercado aceptadas sin llenar).
+- `no_response`: el volumen solicitado durante todo el TTL; la clave queda registrada como duplicado.
 - Rechazo conocido: no se reserva nada.
 
-Alcance: hilos que comparten una conexión en un proceso. No coordina otros procesos, otras conexiones, la operativa manual ni otros robots sobre la misma cuenta. En cuentas *netting*, la orden que amplía una posición existente no coincide con un ticket nuevo y sigue contando hasta que vence el TTL (criterio conservador). Pruebas: `test_mt5_003_*`, sincronizadas con eventos y sin pausas.
+Alcance: hilos que comparten una conexión en un proceso. No coordina otros procesos, otras conexiones, la operativa manual ni otros robots sobre la misma cuenta. En cuentas *netting*, la orden que amplía una posición existente no coincide con un ticket nuevo y sigue contando hasta que vence el TTL (criterio conservador). Si el bróker publicara el remanente RETURN con otro ticket, también seguiría reservado hasta el TTL. Pruebas: `test_mt5_003_*`, sincronizadas con eventos y sin pausas.
+
+### Seguimiento de la revisión del PR #2
+
+La revisión del commit `9fc7a75` encontró que un `partial` reducía la reserva al volumen ejecutado aunque, con `ORDER_FILLING_RETURN`, el remanente sigue activo ([MQL5](https://www.mql5.com/en/book/automation/experts/experts_execution_filling)). Reproducción: Exchange con máscara 0 (RETURN), `max_total_volume=0.15`, BUY 0.10 llenado 0.04 y listados vacíos: se autorizaba otra orden de 0.10 (0.20 en total). Resuelto en `{short}`; pruebas en `tests/unit/test_known_issues.py` (sección «MT5-003 follow-up»):
+
+- [x] RETURN parcial con publicación demorada: el volumen ejecutado más el remanente impide superar el límite con una segunda orden (`test_review_reproduction_return_partial_with_delayed_listing`).
+- [x] IOC parcial: la reserva corresponde al ejecutado cuando el resto fue cancelado (`test_ioc_partial_reserves_only_the_executed_volume`).
+- [x] Orden residual visible y posición aún no visible: no se pierde el presupuesto de la parte ejecutada (`test_working_remainder_listed_without_position_keeps_executed_budget`).
+- [x] Posición y remanente visibles: se reconcilian las reservas sin contar dos veces el mismo volumen (`test_position_and_remainder_listed_are_not_counted_twice`).
+
+Casos adicionales cubiertos: posición visible con el remanente aún no listado, remanente llenado después dentro de la posición, política de llenado desconocida (se conserva el remanente) y los dos huecos que ocupa un RETURN parcial. Contra el código de `9fc7a75` fallan 5 de estas 8 pruebas; las otras 3 comprueban comportamiento que ya era correcto.
 
 ## Validación realizada y trabajo restante
 
 - La suite sin integración de 0.6.0 pasó: **112 pruebas aprobadas, 39 de integración excluidas**, con una advertencia de deprecación de Starlette/httpx.
 - Los tres hallazgos se reprodujeron con `FakeMT5` y respuestas en memoria; no se enviaron operaciones.
+- Tras `546517c`: 143 pruebas aprobadas y 39 de integración excluidas.
 - Tras `cd2001c`: 135 pruebas aprobadas y 39 de integración excluidas. Las 23 pruebas de regresión se ejecutaron también contra el código anterior: 19 fallan allí (las 4 restantes comprueban comportamiento que no debía cambiar).
 - En el despliegue local se verificaron conexión demo, esquema SL/TP, consultas de lectura de XAUUSDm y permisos de trading. `ready_to_trade: true` describe permisos, no una certificación de ejecución o de los controles de riesgo.
 - Sigue pendiente validar en una cuenta demo dedicada apertura con SL/TP, modificación, rechazo, ejecución parcial cuando sea posible y cierres. Las pruebas de integración pueden abrir y cerrar operaciones; deben ejecutarse deliberadamente en una cuenta dedicada.
